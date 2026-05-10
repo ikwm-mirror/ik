@@ -136,7 +136,7 @@ fn focus(cl: ?*Client) void {
             config.border_outer_width,
         );
         std.log.debug("focus: calling applyDecor prev", .{});
-        // applyDecor(prev, false);
+        applyDecor(prev, false);
     }
     if (cl) |next| {
         std.log.debug("focus: setting next border", .{});
