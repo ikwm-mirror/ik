@@ -1,0 +1,10 @@
+#include <fcntl.h>
+#include <linux/input-event-codes.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <swc.h>
+#include <unistd.h>
+#include <wayland-server.h>
+#include <wayland-util.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
+#include <xkbcommon/xkbcommon.h>
