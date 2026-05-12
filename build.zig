@@ -7,8 +7,8 @@ pub fn build(b: *std.Build) void {
     const neuswc_dep = b.dependency("neuswc", .{
         .target = target,
         .optimize = optimize,
-        .xwayland = false,
         .linkage = std.builtin.LinkMode.static,
+        .xwayland = false,
     });
 
     const swc_tc = b.addTranslateC(.{
@@ -49,6 +49,20 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(exe);
+
+    const ctl_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    ctl_mod.addCSourceFile(.{ .file = b.path("src/ikwmc.c"), .flags = &.{"-std=c11"} });
+    ctl_mod.link_libc = true;
+
+    const ctl = b.addExecutable(.{
+        .name = "ikwmc",
+        .root_module = ctl_mod,
+    });
+
+    b.installArtifact(ctl);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

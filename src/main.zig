@@ -1,8 +1,9 @@
 const std = @import("std");
 const swc = @import("swc");
-const config = @import("config.zig");
+const bsp = @import("bsp.zig");
+const ipc = @import("ipc.zig");
 
-// --- Types ---
+// --- State ---
 
 pub const Screen = struct {
     scr: *swc.swc_screen,
@@ -17,22 +18,56 @@ pub const Client = struct {
     win: *swc.swc_window,
     scr: ?*Screen,
     link: swc.struct_wl_list,
-    floating: bool = true,
-    fullscreen: bool = false,
-    mapped: bool = false,
     ws: u32 = 1,
-    x: i32 = 0,
-    y: i32 = 0,
-    w: u32 = 0,
-    h: u32 = 0,
+    floating: bool = false,
+    fullscreen: bool = false,
+    mapped: bool = true,
+
+    // geom when floating / saved when going fullscreen
+    fx: i32 = 0,
+    fy: i32 = 0,
+    fw: u32 = 0,
+    fh: u32 = 0,
+
+    // leaf node for this client (null when floating)
+    bsp_node: ?*bsp.Node = null,
+
     decor: swc.swc_decor = std.mem.zeroes(swc.swc_decor),
     proc_name: [256]u8 = std.mem.zeroes([256]u8),
+};
+
+/// runtime config settings
+pub const Config = struct {
+    border_width: u32 = 2,
+    border_outer_width: u32 = 1,
+    border_color_active: u32 = 0xffb48ead,
+    border_color_normal: u32 = 0xff3d3d56,
+    border_outer_color_active: u32 = 0xff6c6f85,
+    border_outer_color_normal: u32 = 0xff1e1e2e,
+    wallpaper_color: u32 = 0xff1e1e2e,
+    gap_inner: u32 = 8,
+    gap_outer: u32 = 8,
+    motion_throttle_hz: u32 = 60,
 };
 
 pub const Grab = struct {
     active: bool = false,
     resize: bool = false,
     c: ?*Client = null,
+};
+
+/// each workspace gets a bsp tree
+const Workspace = struct {
+    tree: bsp.Tree,
+    focused_node: ?*bsp.Node = null,
+
+    fn init(alloc: std.mem.Allocator) Workspace {
+        return .{ .tree = bsp.Tree.init(alloc) };
+    }
+
+    fn deinit(self: *Workspace) void {
+        self.tree.deinit();
+    }
 };
 
 pub const Wm = struct {
@@ -44,12 +79,18 @@ pub const Wm = struct {
     sel_screen: ?*Screen,
     grab: Grab,
     ws: u32,
+    workspaces: [10]Workspace,
+    cfg: Config,
+
+    // IPC data
+    ipc_server_fd: std.posix.socket_t = -1,
+    ipc_source: ?*swc.wl_event_source = null,
+    ipc_path: [256:0]u8 = std.mem.zeroes([256:0]u8),
 };
 
-// --- Global State ---
+// --- Globals ---
 
 var wm: Wm = undefined;
-
 var gpa: std.mem.Allocator = undefined;
 var io: *const std.Io = undefined;
 
@@ -62,98 +103,10 @@ var screen_handler: swc.swc_screen_handler = .{
     .destroy = onScreenDestroy,
 };
 
-// --- Hardware Callbacks ---
+// --- Helpers ---
 
-pub fn newScreen(scr: ?*swc.swc_screen) callconv(.c) void {
-    const s: *Screen = gpa.create(Screen) catch @panic("OOM: new screen");
-    s.* = .{
-        .scr = scr orelse @panic("null screen"),
-        .link = undefined,
-    };
-    swc.wl_list_insert(&wm.screens, &s.link);
-    if (wm.sel_screen == null) wm.sel_screen = s;
-    swc.swc_screen_set_handler(scr, &screen_handler, s);
-    std.log.debug("new_screen={*}", .{scr});
-}
-
-pub fn newWindow(win: ?*swc.swc_window) callconv(.c) void {
-    const w = win orelse @panic("null window");
-    const pid = swc.swc_window_get_pid(w);
-    if (pid <= 0) {
-        std.log.debug("ignoring window with no pid", .{});
-        swc.swc_window_set_handler(w, null, null);
-        return;
-    }
-    const cl: *Client = gpa.create(Client) catch @panic("OOM: new client");
-    cl.* = .{
-        .win = w,
-        .scr = wm.sel_screen,
-        .link = undefined,
-    };
-
-    w.motion_throttle_ms = 1000 / config.motion_throttle_hz;
-    w.min_width = 1;
-    w.min_height = 1;
-    w.max_width = 0;
-    w.max_height = 0;
-
-    swc.wl_list_insert(&wm.clients, &cl.link);
-    swc.swc_window_set_handler(w, &window_handler, cl);
-    swc.swc_window_set_stacked(w);
-    applyDecor(cl, false);
-
-    var cx: i32 = 0;
-    var cy: i32 = 0;
-    if (swc.swc_cursor_position(&cx, &cy))
-        swc.swc_window_set_position(w, @divTrunc(cx, 256), @divTrunc(cy, 256));
-
-    swc.swc_window_show(w);
-    focus(cl);
-    std.log.debug("new_window={*}", .{w});
-}
-
-pub fn newDevice(_: ?*swc.struct_libinput_device) callconv(.c) void {}
-
-pub const manager: swc.swc_manager = .{
-    .new_screen = newScreen,
-    .new_window = newWindow,
-    .new_device = newDevice,
-    .activate = onActivate,
-    .deactivate = onDeactivate,
-};
-
-// --- Focus/Decor ---
-
-fn focus(cl: ?*Client) void {
-    std.log.debug("focus start", .{});
-    if (wm.sel_client) |prev| {
-        std.log.debug("focus: unsetting prev", .{});
-        swc.swc_window_set_border(
-            prev.win,
-            config.border_color_normal,
-            config.border_width,
-            config.border_outer_color_normal,
-            config.border_outer_width,
-        );
-        std.log.debug("focus: calling applyDecor prev", .{});
-        applyDecor(prev, false);
-    }
-    if (cl) |next| {
-        std.log.debug("focus: setting next border", .{});
-        swc.swc_window_set_border(
-            next.win,
-            config.border_color_active,
-            config.border_width,
-            config.border_outer_color_active,
-            config.border_outer_width,
-        );
-        std.log.debug("focus: calling applyDecor next", .{});
-        applyDecor(next, true);
-        std.log.debug("focus: calling swc_window_focus", .{});
-        swc.swc_window_focus(next.win);
-    }
-    std.log.debug("focus done", .{});
-    wm.sel_client = cl;
+fn curWs() *Workspace {
+    return &wm.workspaces[wm.ws - 1];
 }
 
 fn applyDecor(cl: *Client, active: bool) void {
@@ -166,15 +119,16 @@ fn applyDecor(cl: *Client, active: bool) void {
         swc.swc_window_set_decor(cl.win, null);
         return;
     }
-    cl.decor = config.decor_template;
-    cl.decor.title.color = if (active) 0xffffffff else 0xffc0c0c0;
+    cl.decor = std.mem.zeroes(swc.swc_decor);
+    cl.decor.color = 0xff232136;
+    cl.decor.top = 22;
+    cl.decor.title.enabled = false;
+
     var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pid}) catch {
-        cl.decor.title.enabled = false;
+    _ = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pid}) catch {
         swc.swc_window_set_decor(cl.win, &cl.decor);
         return;
     };
-    _ = path;
     const fd = swc.open(&path_buf, swc.O_RDONLY, @as(c_int, 0));
     if (fd >= 0) {
         defer _ = swc.close(fd);
@@ -186,329 +140,568 @@ fn applyDecor(cl: *Client, active: bool) void {
             cl.proc_name[end] = 0;
             cl.decor.title.string = @ptrCast(&cl.proc_name);
             cl.decor.title.enabled = true;
-        } else {
-            cl.decor.title.enabled = false;
+            cl.decor.title.color = if (active) 0xffffffff else 0xffc0c0c0;
+            cl.decor.title.edge = swc.SWC_DECOR_EDGE_TOP;
+            cl.decor.title.@"align" = swc.SWC_DECOR_ALIGN_CENTER;
         }
-    } else {
-        cl.decor.title.enabled = false;
     }
     swc.swc_window_set_decor(cl.win, &cl.decor);
 }
 
-// --- WS Helpers ---
-
-fn isWsClient(cl: *const Client, s: ?*const Screen) bool {
-    return cl.ws == wm.ws and (s == null or cl.scr == s);
+fn setBorder(cl: *Client, active: bool) void {
+    const cfg = &wm.cfg;
+    swc.swc_window_set_border(
+        cl.win,
+        if (active) cfg.border_color_active else cfg.border_color_normal,
+        cfg.border_width,
+        if (active) cfg.border_outer_color_active else cfg.border_outer_color_normal,
+        cfg.border_outer_width,
+    );
 }
 
-fn firstClient(s: ?*Screen) ?*Client {
-    var it: ?*swc.struct_wl_list = @as(?*swc.struct_wl_list, wm.clients.next);
-    while (it != &wm.clients) : (it = @as(?*swc.struct_wl_list, it.?.next)) {
-        const cl: *Client = @fieldParentPtr("link", @as(*swc.struct_wl_list, it.?));
-        if (isWsClient(cl, s)) return cl;
+fn focus(cl: ?*Client) void {
+    if (wm.sel_client) |prev| {
+        setBorder(prev, false);
+        // applyDecor(prev, false);
+    }
+    if (cl) |next| {
+        setBorder(next, true);
+        // applyDecor(next, true);
+        swc.swc_window_focus(next.win);
+        // update tree
+        if (next.bsp_node) |n| curWs().focused_node = n;
+    } else {
+        swc.swc_window_focus(null);
+    }
+    wm.sel_client = cl;
+}
+
+fn isWsClient(cl: *const Client, ws: u32) bool {
+    return cl.ws == ws;
+}
+
+fn firstClient(ws: u32) ?*Client {
+    var it: ?*swc.struct_wl_list = wm.clients.next;
+    while (it != &wm.clients) : (it = it.?.next) {
+        const cl: *Client = @fieldParentPtr("link", it.?);
+        if (isWsClient(cl, ws)) return cl;
     }
     return null;
 }
 
+/// retile all the tiled clients on the focused ws
+fn retile() void {
+    const ws = curWs();
+    const scr = wm.sel_screen orelse {
+        std.log.debug("retile: no screen", .{});
+        return;
+    };
+    std.log.debug("retile: root={any} focused={any}", .{
+        ws.tree.root != null,
+        ws.focused_node != null,
+    });
+
+    // count nodes
+    ws.tree.forEachLeaf(&struct {
+        fn f(_: *bsp.Node) void {}
+    }.f);
+
+    ws.tree.layout(
+        scr.scr.geometry.x,
+        scr.scr.geometry.y,
+        scr.scr.geometry.width,
+        scr.scr.geometry.height,
+        wm.cfg.gap_inner,
+        wm.cfg.gap_outer,
+        &tileCallback,
+    );
+}
+
+fn tileCallback(client: *anyopaque, x: i32, y: i32, w: u32, h: u32) void {
+    const cl: *Client = @ptrCast(@alignCast(client));
+    std.log.debug("tileCallback: client={*} x={} y={} w={} h={}", .{ cl, x, y, w, h });
+    swc.swc_window_set_geometry(cl.win, &.{ .x = x, .y = y, .width = w, .height = h });
+}
+
 fn syncWindowVisibility() void {
-    var it: ?*swc.struct_wl_list = @as(?*swc.struct_wl_list, wm.clients.next);
+    var it: ?*swc.struct_wl_list = wm.clients.next;
     while (it != &wm.clients) : (it = it.?.next) {
-        const cl: *Client = @fieldParentPtr("link", @as(*swc.struct_wl_list, it.?));
-        if (cl.ws == wm.ws)
-            swc.swc_window_show(cl.win)
-        else
-            swc.swc_window_hide(cl.win);
+        const cl: *Client = @fieldParentPtr("link", it.?);
+        if (cl.ws == wm.ws) swc.swc_window_show(cl.win) else swc.swc_window_hide(cl.win);
     }
 }
 
-// --- Events (Window/Screen) ---
+// --- Hardware ---
+
+pub fn newScreen(scr: ?*swc.swc_screen) callconv(.c) void {
+    const s: *Screen = gpa.create(Screen) catch @panic("OOM");
+    s.* = .{
+        .scr = scr orelse @panic("null screen"),
+        .link = undefined,
+    };
+    swc.wl_list_insert(&wm.screens, &s.link);
+    if (wm.sel_screen == null) wm.sel_screen = s;
+    swc.swc_screen_set_handler(scr, &screen_handler, s);
+}
 
 fn onScreenDestroy(data: ?*anyopaque) callconv(.c) void {
     const s: *Screen = @ptrCast(@alignCast(data orelse return));
     swc.wl_list_remove(&s.link);
-
     if (wm.sel_screen == s) {
-        if (swc.wl_list_empty(&wm.screens) != 0) {
-            wm.sel_screen = null;
-        } else {
-            const next_screen: *Screen = @fieldParentPtr("link", @as(*swc.struct_wl_list, wm.screens.next.?));
-            wm.sel_screen = next_screen;
-        }
+        wm.sel_screen = if (swc.wl_list_empty(&wm.screens) != 0) null else @fieldParentPtr("link", @as(*swc.struct_wl_list, @ptrCast(wm.screens.next)));
     }
-
     gpa.destroy(s);
+}
+
+pub fn newDevice(_: ?*swc.struct_libinput_device) callconv(.c) void {}
+
+pub const manager: swc.swc_manager = .{
+    .new_screen = newScreen,
+    .new_window = newWindow,
+    .new_device = newDevice,
+    .activate = onActivate,
+    .deactivate = onDeactivate,
+};
+
+pub fn onActivate() callconv(.c) void {}
+pub fn onDeactivate() callconv(.c) void {}
+
+// --- Window ---
+
+pub fn newWindow(win: ?*swc.swc_window) callconv(.c) void {
+    const w = win orelse return;
+
+    const cl: *Client = gpa.create(Client) catch @panic("OOM");
+    cl.* = .{
+        .win = w,
+        .scr = wm.sel_screen,
+        .link = undefined,
+        .ws = wm.ws,
+    };
+
+    w.motion_throttle_ms = 1000 / wm.cfg.motion_throttle_hz;
+    w.min_width = 1;
+    w.min_height = 1;
+    w.max_width = 0;
+    w.max_height = 0;
+
+    const ws = curWs();
+    const leaf = ws.tree.insert(cl, ws.focused_node) catch @panic("OOM");
+    cl.bsp_node = leaf;
+    ws.focused_node = leaf;
+
+    swc.wl_list_insert(&wm.clients, &cl.link);
+    swc.swc_window_set_handler(w, &window_handler, cl);
+    swc.swc_window_set_tiled(w);
+    swc.swc_window_show(w);
+    focus(cl);
+    retile();
 }
 
 fn onWinDestroy(data: ?*anyopaque) callconv(.c) void {
     const cl: *Client = @ptrCast(@alignCast(data orelse return));
 
-    if (wm.grab.active and wm.grab.c == cl) {
-        wm.grab.active = false;
-        wm.grab.c = null;
+    if (wm.grab.active and wm.grab.c == cl) wm.grab = .{};
+
+    const cl_ws = cl.ws;
+    const cl_floating = cl.floating;
+
+    if (!cl_floating) {
+        const ws = &wm.workspaces[cl_ws - 1];
+        if (cl.bsp_node) |n| {
+            const sibling: ?*bsp.Node = blk: {
+                const p = n.parent orelse break :blk null;
+                break :blk if (p.left == n) p.right else p.left;
+            };
+            ws.tree.remove(n);
+            ws.focused_node = if (sibling) |s|
+                bsp.Tree.firstLeaf(s)
+            else if (ws.tree.root) |r|
+                bsp.Tree.firstLeaf(r)
+            else
+                null;
+        }
     }
-    if (wm.sel_client == cl) wm.sel_client = null;
 
     swc.wl_list_remove(&cl.link);
-    gpa.destroy(cl);
 
-    var next = firstClient(wm.sel_screen);
-    if (next == null) next = firstClient(null);
-    focus(next);
+    if (wm.sel_client == cl) {
+        wm.sel_client = null;
+        const next = firstClient(wm.ws);
+        if (next) |nc| {
+            if (nc.bsp_node) |bn| wm.workspaces[wm.ws - 1].focused_node = bn;
+        }
+        gpa.destroy(cl);
+        focus(next);
+        if (cl_ws == wm.ws) retile();
+    } else {
+        gpa.destroy(cl);
+        if (cl_ws == wm.ws) retile();
+    }
 }
 
 fn onWinEntered(data: ?*anyopaque) callconv(.c) void {
-    std.log.debug("onWinEntered", .{});
     if (wm.grab.active) return;
     const cl: *Client = @ptrCast(@alignCast(data orelse return));
-    std.log.debug("onWinEntered: checking ws", .{});
-    if (!isWsClient(cl, null)) return;
-    std.log.debug("onWinEntered: calling focus", .{});
+    if (!isWsClient(cl, wm.ws)) return;
     focus(cl);
-    std.log.debug("onWinEntered: done", .{});
 }
 
-// --- Keybinds ---
+// --- IPC ---
 
-pub fn actFocusNext(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    if (swc.wl_list_empty(&wm.clients) != 0) return;
+fn ipcSocketPath(buf: []u8) []const u8 {
+    const xdg = swc.getenv("XDG_RUNTIME_DIR");
+    const dir: []const u8 = if (xdg != null) std.mem.span(xdg.?) else "/tmp";
+    return std.fmt.bufPrint(buf, "{s}/ikwm.sock", .{dir}) catch "/tmp/ikwm.sock";
+}
 
-    const sel = wm.sel_client;
-    if (sel == null or !isWsClient(sel.?, wm.sel_screen)) {
-        var next = firstClient(wm.sel_screen);
-        if (next == null) next = firstClient(null);
-        focus(next);
-        return;
+fn ipcSetup() !void {
+    // I gave up trying to deal with zig's stdlib sockets and just decided to use the C stdlib
+    var path_buf: [256]u8 = undefined;
+    const path = ipcSocketPath(&path_buf);
+
+    _ = swc.unlink(@as([*:0]const u8, @ptrCast(path.ptr)));
+
+    const sock = swc.socket(swc.AF_UNIX, swc.SOCK_STREAM | swc.SOCK_CLOEXEC | swc.SOCK_NONBLOCK, 0);
+    if (sock < 0) return error.SocketCreate;
+    errdefer _ = swc.close(sock);
+
+    var addr: swc.sockaddr_un = undefined;
+    @memset(std.mem.asBytes(&addr), 0);
+    addr.sun_family = swc.AF_UNIX;
+
+    const max_len = @typeInfo(@TypeOf(addr.sun_path)).array.len - 1;
+    const copy_len = @min(path.len, max_len);
+    @memcpy(addr.sun_path[0..copy_len], path[0..copy_len]);
+    addr.sun_path[copy_len] = 0;
+
+    if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0) return error.Bind;
+    if (swc.listen(sock, 16) < 0) return error.Listen;
+
+    wm.ipc_server_fd = sock;
+
+    @memcpy(wm.ipc_path[0..path.len], path);
+    wm.ipc_path[path.len] = 0;
+
+    wm.ipc_source = swc.wl_event_loop_add_fd(
+        wm.ev_loop,
+        sock,
+        swc.WL_EVENT_READABLE,
+        ipcAccept,
+        null,
+    );
+    if (wm.ipc_source == null) return error.EventLoopAddFd;
+
+    var env_buf: [272]u8 = undefined;
+    const env_val = std.fmt.bufPrintZ(&env_buf, "{s}", .{path}) catch return;
+    _ = swc.setenv("IKWM_SOCKET", env_val.ptr, 1);
+}
+
+const IpcConn = struct {
+    fd: c_int,
+    source: *swc.wl_event_source,
+};
+
+fn ipcAccept(_: c_int, _: u32, _: ?*anyopaque) callconv(.c) c_int {
+    const conn = swc.accept(wm.ipc_server_fd, null, null);
+    if (conn < 0) return 0;
+
+    const ipc_conn = gpa.create(IpcConn) catch return 0;
+    ipc_conn.fd = conn;
+
+    const source = swc.wl_event_loop_add_fd(
+        wm.ev_loop,
+        conn,
+        swc.WL_EVENT_READABLE,
+        ipcRead,
+        ipc_conn,
+    ) orelse {
+        gpa.destroy(ipc_conn);
+        _ = swc.close(conn);
+        return 0;
+    };
+    ipc_conn.source = source;
+    return 0;
+}
+
+fn ipcRead(_: c_int, _: u32, data: ?*anyopaque) callconv(.c) c_int {
+    const ipc_conn: *IpcConn = @ptrCast(@alignCast(data orelse return 0));
+    const fd = ipc_conn.fd;
+
+    var buf: [4096]u8 = undefined;
+    const n = swc.read(fd, &buf, buf.len - 1);
+
+    if (n > 0) {
+        const bytes = buf[0..@as(usize, @intCast(n))];
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            const cmd = ipc.parse(trimmed) catch |err| {
+                const msg = switch (err) {
+                    error.UnknownCommand => "error: unknown command\n",
+                    error.MissingArgument => "error: missing argument\n",
+                    error.BadInteger => "error: bad integer\n",
+                    error.BadFloat => "error: bad float\n",
+                    error.BadColor => "error: bad color\n",
+                };
+                _ = swc.send(fd, msg.ptr, msg.len, swc.MSG_NOSIGNAL);
+                continue;
+            };
+            dispatchCmd(cmd, fd);
+        }
     }
 
-    var it: ?*swc.struct_wl_list = @as(?*swc.struct_wl_list, sel.?.link.next);
-    const start = it;
-    while (true) {
-        if (it == &wm.clients) it = wm.clients.next;
-        if (it == &wm.clients) break;
-        const cl: *Client = @fieldParentPtr("link", @as(*swc.struct_wl_list, it.?));
-        if (isWsClient(cl, wm.sel_screen)) {
+    _ = swc.wl_event_source_remove(ipc_conn.source);
+    gpa.destroy(ipc_conn);
+    _ = swc.close(fd);
+    return 0;
+}
+
+fn dispatchCmd(cmd: ipc.Command, reply_fd: c_int) void {
+    switch (cmd) {
+        .focus_next => moveFocus(1),
+        .focus_prev => moveFocus(-1),
+        .focus_dir => |d| focusDir(d),
+        .kill => {
+            if (wm.sel_client) |cl| swc.swc_window_close(cl.win);
+        },
+        .fullscreen => toggleFullscreen(),
+        .floating => setFloating(true),
+        .tiling => setFloating(false),
+        .split => |dir| setSplit(dir),
+        .ratio => |r| setRatio(r),
+        .rotate => rotateSplit(),
+        .gap_inner => |v| {
+            wm.cfg.gap_inner = v;
+            retile();
+        },
+        .gap_outer => |v| {
+            wm.cfg.gap_outer = v;
+            retile();
+        },
+        .border_width => |v| {
+            wm.cfg.border_width = v;
+            reapplyBorders();
+        },
+        .border_outer_width => |v| {
+            wm.cfg.border_outer_width = v;
+            reapplyBorders();
+        },
+        .border_color_active => |v| {
+            wm.cfg.border_color_active = v;
+            reapplyBorders();
+        },
+        .border_color_normal => |v| {
+            wm.cfg.border_color_normal = v;
+            reapplyBorders();
+        },
+        .border_outer_color_active => |v| {
+            wm.cfg.border_outer_color_active = v;
+            reapplyBorders();
+        },
+        .border_outer_color_normal => |v| {
+            wm.cfg.border_outer_color_normal = v;
+            reapplyBorders();
+        },
+        .wallpaper_color => |v| {
+            wm.cfg.wallpaper_color = v;
+            swc.swc_wallpaper_color_set(v);
+        },
+        .workspace_goto => |n| gotoWs(n),
+        .workspace_move => |n| moveToWs(n),
+        .spawn => |cmd_str| spawnCmd(cmd_str),
+        .quit => swc.wl_display_terminate(wm.dpy),
+        .query_focused => {
+            if (wm.sel_client) |cl| {
+                const pid = swc.swc_window_get_pid(cl.win);
+                var pbuf: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(&pbuf, "{d}\n", .{pid}) catch return;
+                _ = swc.write(reply_fd, s.ptr, s.len);
+            } else {
+                _ = swc.write(reply_fd, "none\n", 5);
+            }
+        },
+    }
+}
+
+// --- Actions ---
+
+fn moveFocus(dir: i32) void {
+    if (swc.wl_list_empty(&wm.clients) != 0) return;
+    const sel = wm.sel_client orelse {
+        focus(firstClient(wm.ws));
+        return;
+    };
+
+    var it: ?*swc.struct_wl_list = if (dir > 0) sel.link.next else sel.link.prev;
+    while (it != &wm.clients) : (it = if (dir > 0) it.?.next else it.?.prev) {
+        const cl: *Client = @fieldParentPtr("link", it.?);
+        if (isWsClient(cl, wm.ws)) {
             focus(cl);
             return;
         }
-        it = it.?.next;
-        if (it == start) break;
     }
-
-    var fallback = firstClient(wm.sel_screen);
-    if (fallback == null) fallback = firstClient(null);
-    focus(fallback);
-}
-
-pub fn actFocusPrev(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    if (swc.wl_list_empty(&wm.clients) != 0) return;
-
-    const sel = wm.sel_client;
-    if (sel == null or !isWsClient(sel.?, wm.sel_screen)) {
-        var next = firstClient(wm.sel_screen);
-        if (next == null) next = firstClient(null);
-        focus(next);
-        return;
-    }
-
-    var it: ?*swc.struct_wl_list = @as(?*swc.struct_wl_list, sel.?.link.prev);
-    const start = it;
-    while (true) {
-        if (it == &wm.clients) it = wm.clients.prev;
-        if (it == &wm.clients) break;
-        const cl: *Client = @fieldParentPtr("link", @as(*swc.struct_wl_list, it.?));
-        if (isWsClient(cl, wm.sel_screen)) {
+    // wrap
+    it = if (dir > 0) wm.clients.next else wm.clients.prev;
+    while (it != &wm.clients) : (it = if (dir > 0) it.?.next else it.?.prev) {
+        const cl: *Client = @fieldParentPtr("link", it.?);
+        if (isWsClient(cl, wm.ws)) {
             focus(cl);
             return;
         }
-        it = it.?.prev;
-        if (it == start) break;
     }
-
-    var fallback = firstClient(wm.sel_screen);
-    if (fallback == null) fallback = firstClient(null);
-    focus(fallback);
 }
 
-pub fn actKillSel(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    if (wm.sel_client) |cl| swc.swc_window_close(cl.win);
+fn focusDir(_: ipc.Command.Dir) void {
+    // TODO: Add directional focus based on geom
+    moveFocus(1);
 }
 
-pub fn actFullscreen(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
+fn toggleFullscreen() void {
     const cl = wm.sel_client orelse return;
+    const scr = cl.scr orelse return;
 
     if (cl.fullscreen) {
         cl.fullscreen = false;
         swc.swc_window_set_stacked(cl.win);
-        applyDecor(cl, true);
-        if (cl.w > 0 and cl.h > 0) {
-            swc.swc_window_set_geometry(cl.win, &.{
-                .x = cl.x,
-                .y = cl.y,
-                .width = cl.w,
-                .height = cl.h,
-            });
-        }
-        return;
-    }
-
-    const scr = cl.scr orelse return;
-    var geom: swc.swc_rectangle = undefined;
-    if (swc.swc_window_get_geometry(cl.win, &geom)) {
-        cl.x = geom.x;
-        cl.y = geom.y;
-        cl.w = geom.width;
-        cl.h = geom.height;
-    }
-    cl.fullscreen = true;
-    applyDecor(cl, true);
-    swc.swc_window_set_fullscreen(cl.win, scr.scr);
-}
-
-pub fn actMouseMove(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state == swc.WL_POINTER_BUTTON_STATE_PRESSED) {
-        const cl = wm.sel_client orelse return;
+        // applyDecor(cl, true);
         if (!cl.floating) {
-            cl.floating = true;
-            swc.swc_window_set_stacked(cl.win);
+            retile();
+        } else if (cl.fw > 0) {
+            swc.swc_window_set_geometry(cl.win, &.{ .x = cl.fx, .y = cl.fy, .width = cl.fw, .height = cl.fh });
         }
-        wm.grab = .{ .active = true, .resize = false, .c = cl };
-        swc.swc_window_begin_move(cl.win);
     } else {
-        if (!wm.grab.active or wm.grab.resize) return;
-        if (wm.grab.c) |gc| swc.swc_window_end_move(gc.win);
-        wm.grab = .{};
+        var geom: swc.swc_rectangle = undefined;
+        if (swc.swc_window_get_geometry(cl.win, &geom)) {
+            cl.fx = geom.x;
+            cl.fy = geom.y;
+            cl.fw = geom.width;
+            cl.fh = geom.height;
+        }
+        cl.fullscreen = true;
+        // applyDecor(cl, true);
+        swc.swc_window_set_fullscreen(cl.win, scr.scr);
     }
 }
 
-pub fn actMouseResize(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state == swc.WL_POINTER_BUTTON_STATE_PRESSED) {
-        const cl = wm.sel_client orelse return;
-        if (!cl.floating) {
-            cl.floating = true;
-            swc.swc_window_set_stacked(cl.win);
+fn setFloating(floating: bool) void {
+    const cl = wm.sel_client orelse return;
+    if (cl.floating == floating) return;
+
+    if (floating) {
+        // remove from tree
+        if (cl.bsp_node) |n| {
+            const ws = &wm.workspaces[cl.ws - 1];
+            if (ws.focused_node == n) ws.focused_node = null;
+            ws.tree.remove(n);
+            cl.bsp_node = null;
         }
-        wm.grab = .{ .active = true, .resize = true, .c = cl };
-        swc.swc_window_begin_resize(
-            cl.win,
-            swc.SWC_WINDOW_EDGE_RIGHT | swc.SWC_WINDOW_EDGE_BOTTOM,
-        );
+        cl.floating = true;
+        swc.swc_window_set_stacked(cl.win);
+        retile();
     } else {
-        if (!wm.grab.active or !wm.grab.resize) return;
-        if (wm.grab.c) |gc| swc.swc_window_end_resize(gc.win);
-        wm.grab = .{};
+        // insert into tree
+        const ws = curWs();
+        const leaf = ws.tree.insert(cl, ws.focused_node) catch return;
+        cl.bsp_node = leaf;
+        ws.focused_node = leaf;
+        cl.floating = false;
+        swc.swc_window_set_tiled(cl.win);
+        retile();
     }
 }
 
-pub fn actQuit(
-    _: ?*anyopaque,
-    _: u32,
-    _: u32,
-    _: u32,
-) callconv(.c) void {
-    swc.wl_display_terminate(wm.dpy);
+fn setSplit(dir: bsp.Dir) void {
+    const ws = curWs();
+    const node = ws.focused_node orelse return;
+    const parent = node.parent orelse return;
+    parent.split_dir = dir;
+    retile();
 }
 
-/// data must point to a null-sentinel argv: [*:null]?[*:0]u8
-pub fn actSpawn(
-    data: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    const argv_c: [*:null]?[*:0]const u8 = @ptrCast(@alignCast(data orelse return));
-    const cmd = argv_c[0] orelse return;
+fn setRatio(r: f32) void {
+    const ws = curWs();
+    const node = ws.focused_node orelse return;
+    const parent = node.parent orelse return;
+    parent.ratio = std.math.clamp(r, 0.1, 0.9);
+    retile();
+}
+
+fn rotateSplit() void {
+    const ws = curWs();
+    const node = ws.focused_node orelse return;
+    const parent = node.parent orelse return;
+    parent.split_dir = if (parent.split_dir == .horizontal) .vertical else .horizontal;
+    retile();
+}
+
+fn reapplyBorders() void {
+    var it: ?*swc.struct_wl_list = wm.clients.next;
+    while (it != &wm.clients) : (it = it.?.next) {
+        const cl: *Client = @fieldParentPtr("link", it.?);
+        setBorder(cl, wm.sel_client == cl);
+    }
+}
+
+fn gotoWs(n: u32) void {
+    if (n < 1 or n > 9 or n == wm.ws) return;
+    wm.ws = n;
+    syncWindowVisibility();
+    retile();
+    focus(firstClient(wm.ws));
+}
+
+fn moveToWs(n: u32) void {
+    const cl = wm.sel_client orelse return;
+    if (n < 1 or n > 9 or cl.ws == n) return;
+
+    // remove from current tree
+    if (!cl.floating) {
+        const old_ws = &wm.workspaces[cl.ws - 1];
+        if (cl.bsp_node) |leaf| {
+            if (old_ws.focused_node == leaf) old_ws.focused_node = null;
+            old_ws.tree.remove(leaf);
+            cl.bsp_node = null;
+        }
+    }
+
+    cl.ws = n;
+
+    // insert into dest tree (if tiling)
+    if (!cl.floating) {
+        const new_ws = &wm.workspaces[n - 1];
+        const leaf = new_ws.tree.insert(cl, new_ws.focused_node) catch return;
+        cl.bsp_node = leaf;
+    }
+
+    if (cl.ws != wm.ws) swc.swc_window_hide(cl.win) else swc.swc_window_show(cl.win);
+
+    retile();
+    focus(firstClient(wm.ws));
+}
+
+fn spawnCmd(cmd_str: []const u8) void {
+    // cmd_str is borrowed, copy to stack sentinel string
+    var buf: [1024:0]u8 = undefined;
+    const len = @min(cmd_str.len, buf.len - 1);
+    @memcpy(buf[0..len], cmd_str[0..len]);
+    buf[len] = 0;
 
     const pid = swc.fork();
     if (pid == 0) {
         _ = swc.setsid();
         var fd: c_int = 3;
         while (fd < 1024) : (fd += 1) _ = swc.close(fd);
-        _ = swc.execl("/bin/sh", "/bin/sh", "-c", cmd, @as(?[*:0]const u8, null));
+        _ = swc.execl("/bin/sh", "/bin/sh", "-c", @as([*:0]const u8, @ptrCast(&buf)), @as(?[*:0]const u8, null));
         swc.exit(1);
     }
-}
-
-pub fn actWorkspaceGoto(
-    data: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    const ws: *u32 = @ptrCast(@alignCast(data orelse return));
-    if (ws.* < 1 or ws.* > 9 or ws.* == wm.ws) return;
-    wm.ws = ws.*;
-    syncWindowVisibility();
-    var next = firstClient(wm.sel_screen);
-    if (next == null) next = firstClient(null);
-    focus(next);
-}
-
-pub fn actWorkspaceMoveto(
-    data: ?*anyopaque,
-    _: u32,
-    _: u32,
-    state: u32,
-) callconv(.c) void {
-    if (state != swc.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    const cl = wm.sel_client orelse return;
-    const ws: *u32 = @ptrCast(@alignCast(data orelse return));
-    if (ws.* < 1 or ws.* > 9 or cl.ws == ws.*) return;
-    cl.ws = ws.*;
-    if (cl.ws == wm.ws) swc.swc_window_show(cl.win) else swc.swc_window_hide(cl.win);
-    var next = firstClient(wm.sel_screen);
-    if (next == null) next = firstClient(null);
-    focus(next);
 }
 
 // --- Signals ---
 
 fn sigHandler(_: c_int) callconv(.c) void {
     swc.wl_display_terminate(wm.dpy);
-}
-
-// --- Seat ---
-pub fn onActivate() callconv(.c) void {
-    std.log.debug("activate", .{});
-}
-
-pub fn onDeactivate() callconv(.c) void {
-    std.log.debug("deactivate", .{});
 }
 
 // --- Setup ---
@@ -523,37 +716,78 @@ fn setup() !void {
     wm.sel_screen = null;
     wm.grab = .{};
     wm.ws = 1;
+    wm.cfg = .{};
+
+    // init workspaces
+    for (&wm.workspaces) |*ws| ws.* = Workspace.init(gpa);
 
     if (!swc.swc_initialize(wm.dpy, wm.ev_loop, &manager))
         return error.SwcInit;
 
-    swc.swc_wallpaper_color_set(config.wallpaper_color);
-
-    for (config.binds) |bind| {
-        _ = swc.swc_add_binding(bind.type, bind.mods, bind.ksym, bind.handler, bind.data);
-    }
+    swc.swc_wallpaper_color_set(wm.cfg.wallpaper_color);
 
     const sock = swc.wl_display_add_socket_auto(wm.dpy) orelse
         return error.Socket;
     _ = swc.setenv("WAYLAND_DISPLAY", sock, 1);
-    std.log.info("WAYLAND_DISPLAY={s}", .{sock});
 
     _ = swc.signal(swc.SIGINT, sigHandler);
     _ = swc.signal(swc.SIGTERM, sigHandler);
     _ = swc.signal(swc.SIGQUIT, sigHandler);
+
+    try ipcSetup();
 }
+
+fn runAutostart() void {
+    // check env first, then default path
+    var buf: [512:0]u8 = undefined;
+
+    const env_path = swc.getenv("IKWM_AUTOSTART");
+    if (env_path != null) {
+        const pid = swc.fork();
+        if (pid == 0) {
+            _ = swc.setsid();
+            _ = swc.execl(env_path.?, env_path.?, @as(?[*:0]const u8, null));
+            swc.exit(0);
+        }
+        return;
+    }
+
+    const home = swc.getenv("HOME");
+    if (home == null) return;
+
+    const home_str = std.mem.span(home.?);
+    const path = std.fmt.bufPrintZ(&buf, "{s}/.config/ikwm/autostart", .{home_str}) catch return;
+
+    // check if executable
+    if (swc.access(path.ptr, swc.X_OK) != 0) return;
+
+    const pid = swc.fork();
+    if (pid == 0) {
+        _ = swc.setsid();
+        _ = swc.execl(path.ptr, path.ptr, @as(?[*:0]const u8, null));
+        swc.exit(0);
+    }
+}
+
+// --- Main ---
 
 pub fn main(init: std.process.Init) !void {
     gpa = init.gpa;
     io = &init.io;
 
-    std.log.info("starting ikwm", .{}); // erm dont delete this or the entire thing hangs
+    std.log.info("starting ikwm", .{});
 
     try setup();
     defer {
+        // clean ipc socket
+        if (wm.ipc_path[0] != 0) _ = swc.unlink(&wm.ipc_path);
+        // clean workspaces
+        for (&wm.workspaces) |*ws| ws.deinit();
         swc.swc_finalize();
         swc.wl_display_destroy(wm.dpy);
     }
+
+    runAutostart();
 
     swc.wl_display_run(wm.dpy);
 }
