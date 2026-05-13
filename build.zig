@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .linkage = std.builtin.LinkMode.static,
-        .xwayland = true,
+        .xwayland = false,
     });
 
     const swc_tc = b.addTranslateC(.{

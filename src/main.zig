@@ -17,28 +17,24 @@ pub const Screen = struct {
 pub const Client = struct {
     win: *swc.swc_window,
     scr: ?*Screen,
-    /// node in the global client list
     link: swc.struct_wl_list,
-    /// node in the workspace client list
     ws_link: swc.struct_wl_list,
     ws: u32 = 1,
     floating: bool = false,
     fullscreen: bool = false,
     mapped: bool = true,
+    decor_enabled: bool = true,
 
-    // geom when floating / saved when going fullscreen
     fx: i32 = 0,
     fy: i32 = 0,
     fw: u32 = 0,
     fh: u32 = 0,
 
-    // leaf node for this client (null when floating)
     bsp_node: ?*bsp.Node = null,
 
-    decor: swc.swc_decor = undefined,
-    /// cached process name
-    proc_name: [256]u8 = undefined,
-    proc_name_len: usize = 0, // 0 = not fetched
+    decor: swc.swc_decor = std.mem.zeroes(swc.swc_decor),
+    proc_name: [256]u8 = std.mem.zeroes([256]u8),
+    proc_name_len: usize = 0,
 };
 
 pub const Config = struct {
@@ -52,6 +48,8 @@ pub const Config = struct {
     gap_inner: u32 = 8,
     gap_outer: u32 = 8,
     motion_throttle_hz: u32 = 60,
+    decor_default: bool = true,
+    workspace_count: u32 = 9,
 };
 
 pub const Grab = struct {
@@ -64,12 +62,6 @@ const Workspace = struct {
     tree: bsp.Tree,
     focused_node: ?*bsp.Node = null,
     clients: swc.struct_wl_list = undefined,
-
-    fn init(alloc: std.mem.Allocator) Workspace {
-        var ws = Workspace{ .tree = bsp.Tree.init(alloc) };
-        swc.wl_list_init(&ws.clients);
-        return ws;
-    }
 
     fn deinit(self: *Workspace) void {
         self.tree.deinit();
@@ -88,12 +80,10 @@ pub const Wm = struct {
     workspaces: [10]Workspace,
     cfg: Config,
 
-    // IPC data
     ipc_server_fd: std.posix.socket_t = -1,
     ipc_source: ?*swc.wl_event_source = null,
     ipc_path: [256:0]u8 = std.mem.zeroes([256:0]u8),
 
-    // retile batching
     retile_pending: bool = false,
     retile_idle: ?*swc.wl_event_source = null,
 };
@@ -117,6 +107,21 @@ var screen_handler: swc.swc_screen_handler = .{
 
 fn curWs() *Workspace {
     return &wm.workspaces[wm.ws - 1];
+}
+
+fn wsClients(ws_idx: usize) *swc.struct_wl_list {
+    return &wm.workspaces[ws_idx].clients;
+}
+
+fn firstWsClient(ws: u32) ?*Client {
+    const head = wsClients(ws - 1);
+    if (swc.wl_list_empty(head) != 0) return null;
+    const next_ptr: *swc.struct_wl_list = @ptrCast(head.next.?);
+    return @fieldParentPtr("ws_link", next_ptr);
+}
+
+fn isWsClient(cl: *const Client, ws: u32) bool {
+    return cl.ws == ws;
 }
 
 // --- App Name ---
@@ -147,7 +152,7 @@ fn procName(cl: *Client) []const u8 {
 // --- Decor ---
 
 fn applyDecor(cl: *Client, active: bool) void {
-    if (cl.fullscreen) {
+    if (cl.fullscreen or !cl.decor_enabled) {
         swc.swc_window_set_decor(cl.win, null);
         return;
     }
@@ -172,6 +177,20 @@ fn applyDecor(cl: *Client, active: bool) void {
     swc.swc_window_set_decor(cl.win, &cl.decor);
 }
 
+fn setDecorFocused(enabled: bool) void {
+    const cl = wm.sel_client orelse return;
+    if (cl.decor_enabled == enabled) return;
+    cl.decor_enabled = enabled;
+    applyDecor(cl, true);
+    scheduleRetile();
+}
+
+fn setDecorGlobal(enabled: bool) void {
+    wm.cfg.decor_default = enabled;
+}
+
+// --- Borders ---
+
 fn setBorder(cl: *Client, active: bool) void {
     const cfg = &wm.cfg;
     swc.swc_window_set_border(
@@ -186,11 +205,9 @@ fn setBorder(cl: *Client, active: bool) void {
 fn focus(cl: ?*Client) void {
     if (wm.sel_client) |prev| {
         setBorder(prev, false);
-        // applyDecor(prev, false);
     }
     if (cl) |next| {
         setBorder(next, true);
-        // applyDecor(next, true);
         swc.swc_window_focus(next.win);
         if (next.bsp_node) |n| curWs().focused_node = n;
     } else {
@@ -199,29 +216,11 @@ fn focus(cl: ?*Client) void {
     wm.sel_client = cl;
 }
 
-// --- Client List ---
-
-fn wsClients(ws_idx: usize) *swc.struct_wl_list {
-    return &wm.workspaces[ws_idx].clients;
-}
-
-fn firstWsClient(ws: u32) ?*Client {
-    const head = wsClients(ws - 1);
-    if (swc.wl_list_empty(head) != 0) return null;
-    const next_ptr: *swc.struct_wl_list = @ptrCast(head.next.?);
-    return @fieldParentPtr("ws_link", next_ptr);
-}
-
-fn isWsClient(cl: *const Client, ws: u32) bool {
-    return cl.ws == ws;
-}
-
 // --- Retile ---
 
 fn scheduleRetile() void {
     if (wm.retile_pending) return;
     wm.retile_pending = true;
-
     if (wm.retile_idle == null) {
         wm.retile_idle = swc.wl_event_loop_add_idle(
             wm.ev_loop,
@@ -239,15 +238,11 @@ fn doRetileIdle(_: ?*anyopaque) callconv(.c) void {
 
 fn retile() void {
     const ws = curWs();
-    const scr = wm.sel_screen orelse {
-        std.log.debug("retile: no screen", .{});
-        return;
-    };
+    const scr = wm.sel_screen orelse return;
     std.log.debug("retile: root={any} focused={any}", .{
         ws.tree.root != null,
         ws.focused_node != null,
     });
-
     ws.tree.layout(
         scr.scr.geometry.x,
         scr.scr.geometry.y,
@@ -261,7 +256,6 @@ fn retile() void {
 
 fn tileCallback(client: *anyopaque, x: i32, y: i32, w: u32, h: u32) void {
     const cl: *Client = @ptrCast(@alignCast(client));
-    std.log.debug("tileCallback: client={*} x={} y={} w={} h={}", .{ cl, x, y, w, h });
     swc.swc_window_set_geometry(cl.win, &.{ .x = x, .y = y, .width = w, .height = h });
 }
 
@@ -277,10 +271,7 @@ fn syncWindowVisibility() void {
 
 pub fn newScreen(scr: ?*swc.swc_screen) callconv(.c) void {
     const s: *Screen = gpa.create(Screen) catch @panic("OOM");
-    s.* = .{
-        .scr = scr orelse @panic("null screen"),
-        .link = undefined,
-    };
+    s.* = .{ .scr = scr orelse @panic("null screen"), .link = undefined };
     swc.wl_list_insert(&wm.screens, &s.link);
     if (wm.sel_screen == null) wm.sel_screen = s;
     swc.swc_screen_set_handler(scr, &screen_handler, s);
@@ -290,7 +281,10 @@ fn onScreenDestroy(data: ?*anyopaque) callconv(.c) void {
     const s: *Screen = @ptrCast(@alignCast(data orelse return));
     swc.wl_list_remove(&s.link);
     if (wm.sel_screen == s) {
-        wm.sel_screen = if (swc.wl_list_empty(&wm.screens) != 0) null else @fieldParentPtr("link", @as(*swc.struct_wl_list, @ptrCast(wm.screens.next)));
+        wm.sel_screen = if (swc.wl_list_empty(&wm.screens) != 0)
+            null
+        else
+            @fieldParentPtr("link", @as(*swc.struct_wl_list, @ptrCast(wm.screens.next)));
     }
     gpa.destroy(s);
 }
@@ -320,6 +314,7 @@ pub fn newWindow(win: ?*swc.swc_window) callconv(.c) void {
         .link = undefined,
         .ws_link = undefined,
         .ws = wm.ws,
+        .decor_enabled = wm.cfg.decor_default,
     };
 
     w.motion_throttle_ms = 1000 / wm.cfg.motion_throttle_hz;
@@ -353,6 +348,7 @@ fn onWinDestroy(data: ?*anyopaque) callconv(.c) void {
     if (!cl_floating) {
         const ws = &wm.workspaces[cl_ws - 1];
         if (cl.bsp_node) |n| {
+            // pick the sibling to focus after removal
             const sibling: ?*bsp.Node = blk: {
                 const p = n.parent orelse break :blk null;
                 break :blk if (p.left == n) p.right else p.left;
@@ -419,16 +415,15 @@ fn ipcSetup() !void {
     @memcpy(addr.sun_path[0..copy_len], path[0..copy_len]);
     addr.sun_path[copy_len] = 0;
 
+    // retry once to recover from a stale socket left by a previous crash
     if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0) {
         _ = swc.unlink(@ptrCast(&addr.sun_path));
-        if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0) {
+        if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0)
             return error.Bind;
-        }
     }
     if (swc.listen(sock, 16) < 0) return error.Listen;
 
     wm.ipc_server_fd = sock;
-
     @memcpy(wm.ipc_path[0..path.len], path);
     wm.ipc_path[path.len] = 0;
 
@@ -521,6 +516,7 @@ fn dispatchCmd(cmd: ipc.Command, reply_fd: c_int) void {
         .split => |dir| setSplit(dir),
         .ratio => |r| setRatio(r),
         .rotate => rotateSplit(),
+
         .gap_inner => |v| {
             wm.cfg.gap_inner = v;
             scheduleRetile();
@@ -529,6 +525,7 @@ fn dispatchCmd(cmd: ipc.Command, reply_fd: c_int) void {
             wm.cfg.gap_outer = v;
             scheduleRetile();
         },
+
         .border_width => |v| {
             wm.cfg.border_width = v;
             reapplyBorders();
@@ -553,14 +550,22 @@ fn dispatchCmd(cmd: ipc.Command, reply_fd: c_int) void {
             wm.cfg.border_outer_color_normal = v;
             reapplyBorders();
         },
+
         .wallpaper_color => |v| {
             wm.cfg.wallpaper_color = v;
             swc.swc_wallpaper_color_set(v);
         },
+
+        .decor_focused => |v| setDecorFocused(v),
+        .decor_global => |v| setDecorGlobal(v),
+
         .workspace_goto => |n| gotoWs(n),
         .workspace_move => |n| moveToWs(n),
+        .workspace_count => |n| setWorkspaceCount(n),
+
         .spawn => |cmd_str| spawnCmd(cmd_str),
         .quit => swc.wl_display_terminate(wm.dpy),
+
         .query_focused => {
             if (wm.sel_client) |cl| {
                 const pid = swc.swc_window_get_pid(cl.win);
@@ -570,6 +575,15 @@ fn dispatchCmd(cmd: ipc.Command, reply_fd: c_int) void {
             } else {
                 _ = swc.write(reply_fd, "none\n", 5);
             }
+        },
+
+        .query_workspaces => {
+            var pbuf: [64]u8 = undefined;
+            const s = std.fmt.bufPrint(&pbuf, "count {d}\ncurrent {d}\n", .{
+                wm.cfg.workspace_count,
+                wm.ws,
+            }) catch return;
+            _ = swc.write(reply_fd, s.ptr, s.len);
         },
     }
 }
@@ -587,11 +601,11 @@ fn moveFocus(dir: i32) void {
 
     const next_link = if (dir > 0) sel.ws_link.next else sel.ws_link.prev;
     const target_link = if (next_link == head)
-        (if (dir > 0) head.next else head.prev)
+        (if (dir > 0) head.next else head.prev) // wrap around
     else
         next_link;
 
-    if (target_link == head) return; // only one client
+    if (target_link == head) return;
     const target_ptr: *swc.struct_wl_list = @ptrCast(target_link.?);
     focus(@fieldParentPtr("ws_link", target_ptr));
 }
@@ -655,7 +669,7 @@ fn toggleFullscreen() void {
     if (cl.fullscreen) {
         cl.fullscreen = false;
         swc.swc_window_set_stacked(cl.win);
-        // applyDecor(cl, true);
+        applyDecor(cl, true);
         if (!cl.floating) {
             scheduleRetile();
         } else if (cl.fw > 0) {
@@ -670,7 +684,7 @@ fn toggleFullscreen() void {
             cl.fh = geom.height;
         }
         cl.fullscreen = true;
-        // applyDecor(cl, true);
+        applyDecor(cl, true);
         swc.swc_window_set_fullscreen(cl.win, scr.scr);
     }
 }
@@ -726,6 +740,7 @@ fn rotateSplit() void {
 
 fn reapplyBorders() void {
     const head = wsClients(wm.ws - 1);
+    if (swc.wl_list_empty(head) != 0) return;
     var it: ?*swc.struct_wl_list = head.next;
     while (it != head) : (it = it.?.next) {
         const cl: *Client = @fieldParentPtr("ws_link", it.?);
@@ -734,18 +749,17 @@ fn reapplyBorders() void {
 }
 
 fn gotoWs(n: u32) void {
-    if (n < 1 or n > 9 or n == wm.ws) return;
+    if (n < 1 or n > wm.cfg.workspace_count or n == wm.ws) return;
     wm.ws = n;
     syncWindowVisibility();
-    retile();
+    retile(); // must layout before focus
     focus(firstWsClient(wm.ws));
 }
 
 fn moveToWs(n: u32) void {
     const cl = wm.sel_client orelse return;
-    if (n < 1 or n > 9 or cl.ws == n) return;
+    if (n < 1 or n > wm.cfg.workspace_count or cl.ws == n) return;
 
-    // rm from old workspace lists
     if (!cl.floating) {
         const old_ws = &wm.workspaces[cl.ws - 1];
         if (cl.bsp_node) |leaf| {
@@ -757,9 +771,8 @@ fn moveToWs(n: u32) void {
     swc.wl_list_remove(&cl.ws_link);
 
     cl.ws = n;
-
-    // ins into destination workspace lists
     swc.wl_list_insert(wsClients(n - 1), &cl.ws_link);
+
     if (!cl.floating) {
         const new_ws = &wm.workspaces[n - 1];
         const leaf = new_ws.tree.insert(cl, new_ws.focused_node) catch return;
@@ -769,6 +782,57 @@ fn moveToWs(n: u32) void {
     if (cl.ws != wm.ws) swc.swc_window_hide(cl.win) else swc.swc_window_show(cl.win);
 
     scheduleRetile();
+    focus(firstWsClient(wm.ws));
+}
+
+fn setWorkspaceCount(count: u32) void {
+    const new_count = std.math.clamp(count, 1, 10);
+    const old_count = wm.cfg.workspace_count;
+    if (new_count == old_count) return;
+
+    if (new_count < old_count) {
+        // evacuate clients from removed workspaces into the new last one
+        var ws_idx: u32 = new_count;
+        while (ws_idx < old_count) : (ws_idx += 1) {
+            const src = &wm.workspaces[ws_idx];
+            while (swc.wl_list_empty(&src.clients) == 0) {
+                const next_ptr: *swc.struct_wl_list = @ptrCast(src.clients.next.?);
+                const cl: *Client = @fieldParentPtr("ws_link", next_ptr);
+
+                if (!cl.floating) {
+                    if (cl.bsp_node) |leaf| {
+                        if (src.focused_node == leaf) src.focused_node = null;
+                        src.tree.remove(leaf);
+                        cl.bsp_node = null;
+                    }
+                }
+                swc.wl_list_remove(&cl.ws_link);
+
+                cl.ws = new_count;
+                swc.wl_list_insert(wsClients(new_count - 1), &cl.ws_link);
+
+                if (!cl.floating) {
+                    const dst = &wm.workspaces[new_count - 1];
+                    const leaf = dst.tree.insert(cl, dst.focused_node) catch continue;
+                    cl.bsp_node = leaf;
+                    dst.focused_node = leaf;
+                }
+
+                if (cl.ws == wm.ws)
+                    swc.swc_window_show(cl.win)
+                else
+                    swc.swc_window_hide(cl.win);
+            }
+        }
+
+        if (wm.ws > new_count) {
+            wm.ws = new_count;
+            syncWindowVisibility();
+        }
+    }
+
+    wm.cfg.workspace_count = new_count;
+    retile();
     focus(firstWsClient(wm.ws));
 }
 
@@ -782,7 +846,7 @@ fn spawnCmd(cmd_str: []const u8) void {
     if (pid == 0) {
         _ = swc.setsid();
         var fd: c_int = 3;
-        while (fd < 1024) : (fd += 1) _ = swc.close(fd);
+        while (fd < 1024) : (fd += 1) _ = swc.close(fd); // close inherited fds
         _ = swc.execl("/bin/sh", "/bin/sh", "-c", @as([*:0]const u8, @ptrCast(&buf)), @as(?[*:0]const u8, null));
         swc.exit(1);
     }
@@ -810,10 +874,22 @@ fn setup() !void {
     wm.retile_pending = false;
     wm.retile_idle = null;
 
-    for (&wm.workspaces) |*ws| ws.* = Workspace.init(gpa);
+    for (&wm.workspaces) |*ws| {
+        ws.tree = bsp.Tree.init(gpa);
+        ws.focused_node = null;
+        swc.wl_list_init(&ws.clients);
+    }
 
-    if (!swc.swc_initialize(wm.dpy, wm.ev_loop, &manager))
+    if (!swc.swc_initialize(wm.dpy, wm.ev_loop, &manager)) {
+        // swc may have called newScreen before failing; clean up
+        while (swc.wl_list_empty(&wm.screens) == 0) {
+            const next_ptr: *swc.struct_wl_list = @ptrCast(wm.screens.next.?);
+            const s: *Screen = @fieldParentPtr("link", next_ptr);
+            swc.wl_list_remove(&s.link);
+            gpa.destroy(s);
+        }
         return error.SwcInit;
+    }
 
     swc.swc_wallpaper_color_set(wm.cfg.wallpaper_color);
 
@@ -844,10 +920,8 @@ fn runAutostart() void {
 
     const home = swc.getenv("HOME");
     if (home == null) return;
-
     const home_str = std.mem.span(home.?);
     const path = std.fmt.bufPrintZ(&buf, "{s}/.config/ikwm/autostart", .{home_str}) catch return;
-
     if (swc.access(path.ptr, swc.X_OK) != 0) return;
 
     const pid = swc.fork();
@@ -876,6 +950,5 @@ pub fn main(init: std.process.Init) !void {
     }
 
     runAutostart();
-
     swc.wl_display_run(wm.dpy);
 }

@@ -16,17 +16,19 @@ static const char *usage =
     "  tiling\n"
     "  rotate\n"
     "  split h|v|horizontal|vertical\n"
-    "  ratio <0.1-0.9>\n"
-    "  gap inner|outer <n>\n"
-    "  border width <n>\n"
-    "  border outer_width <n>\n"
-    "  border color active|normal|outer_active|outer_normal <xxxxxxxx>\n"
-    "  wallpaper color <xxxxxxxx>\n"
+    "  ratio <f32>\n"
+    "  gap inner|outer <u32>\n"
+    "  border width|inner_width|outer_width <u32>\n"
+    "  border color|inner_color active|normal|outer_active|outer_normal <hex>\n"
+    "  border outer_color active|normal <hex>\n"
+    "  wallpaper color <hex>\n"
+    "  decor on|off\n"
+    "  decor global on|off\n"
+    "  workspaces <n>\n"
     "  workspace <n>\n"
-    "  workspace goto <n>\n"
-    "  workspace move <n>\n"
+    "  workspace goto|move <n>\n"
     "  spawn <command...>\n"
-    "  query focused\n"
+    "  query focused|workspaces\n"
     "  quit\n";
 
 int main(int argc, char **argv) {
@@ -35,16 +37,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  /* build command string (argv[1..]) */
   size_t total = 0;
   for (int i = 1; i < argc; i++)
-    total += strlen(argv[i]) + 1; // space or newline
+    total += strlen(argv[i]) + 1;
 
   char *cmd = malloc(total + 1);
-  if (!cmd) {
-    perror("malloc");
+  if (!cmd)
     return 1;
-  }
 
   cmd[0] = '\0';
   for (int i = 1; i < argc; i++) {
@@ -54,7 +53,6 @@ int main(int argc, char **argv) {
   }
   strcat(cmd, "\n");
 
-  /* socket path */
   char path_buf[256];
   const char *sock_path = getenv("IKWM_SOCKET");
   if (!sock_path) {
@@ -67,7 +65,6 @@ int main(int argc, char **argv) {
 
   int sock = socket(AF_UNIX, SOCK_STREAM, 0);
   if (sock < 0) {
-    perror("socket");
     free(cmd);
     return 1;
   }
@@ -78,8 +75,6 @@ int main(int argc, char **argv) {
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    fprintf(stderr, "ikwmctl: cannot connect to %s: ", sock_path);
-    perror(NULL);
     close(sock);
     free(cmd);
     return 1;
@@ -89,18 +84,13 @@ int main(int argc, char **argv) {
   size_t sent = 0;
   while (sent < len) {
     ssize_t n = write(sock, cmd + sent, len - sent);
-    if (n < 0) {
-      perror("write");
-      close(sock);
-      free(cmd);
-      return 1;
-    }
+    if (n < 0)
+      break;
     sent += (size_t)n;
   }
   free(cmd);
 
-  int is_query = strncmp(argv[1], "query", 5) == 0;
-  if (is_query) {
+  if (strncmp(argv[1], "query", 5) == 0) {
     shutdown(sock, SHUT_WR);
     char buf[4096];
     ssize_t n;
