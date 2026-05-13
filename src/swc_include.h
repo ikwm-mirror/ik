@@ -1,4 +1,4 @@
-/* all the headers zig should generate c bindings for */
+/* all the headers we want */
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>

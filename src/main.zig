@@ -233,16 +233,12 @@ fn scheduleRetile() void {
 fn doRetileIdle(_: ?*anyopaque) callconv(.c) void {
     wm.retile_idle = null;
     wm.retile_pending = false;
-    retile();
+    retile(null);
 }
 
-fn retile() void {
-    const ws = curWs();
+fn retile(ws_idx: ?usize) void {
+    var ws = if (ws_idx) |wid| &wm.workspaces[wid] else curWs();
     const scr = wm.sel_screen orelse return;
-    std.log.debug("retile: root={any} focused={any}", .{
-        ws.tree.root != null,
-        ws.focused_node != null,
-    });
     ws.tree.layout(
         scr.scr.geometry.x,
         scr.scr.geometry.y,
@@ -752,7 +748,7 @@ fn gotoWs(n: u32) void {
     if (n < 1 or n > wm.cfg.workspace_count or n == wm.ws) return;
     wm.ws = n;
     syncWindowVisibility();
-    retile(); // must layout before focus
+    scheduleRetile();
     focus(firstWsClient(wm.ws));
 }
 
@@ -832,7 +828,7 @@ fn setWorkspaceCount(count: u32) void {
     }
 
     wm.cfg.workspace_count = new_count;
-    retile();
+    retile(null);
     focus(firstWsClient(wm.ws));
 }
 
@@ -881,7 +877,7 @@ fn setup() !void {
     }
 
     if (!swc.swc_initialize(wm.dpy, wm.ev_loop, &manager)) {
-        // swc may have called newScreen before failing; clean up
+        // swc mey have called newScreen before failing; clean up
         while (swc.wl_list_empty(&wm.screens) == 0) {
             const next_ptr: *swc.struct_wl_list = @ptrCast(wm.screens.next.?);
             const s: *Screen = @fieldParentPtr("link", next_ptr);
