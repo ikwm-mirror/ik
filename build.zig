@@ -48,6 +48,9 @@ pub fn build(b: *std.Build) void {
         .use_lld = true,
     });
 
+    const panthera = b.dependency("panthera", .{ .target = target, .optimize = optimize });
+    exe.root_module.addImport("panthera", panthera.module("panthera"));
+
     b.installArtifact(exe);
 
     const ctl_mod = b.createModule(.{

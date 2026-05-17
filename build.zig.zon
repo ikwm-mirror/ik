@@ -36,6 +36,10 @@
             .url = "git+https://codeberg.org/ikwm/neuswc#8669aeaf36ef48c03b6a4eb9462767c0da8d858e",
             .hash = "neuswc-0.0.0-6uQoqqT5CgCF36Yrhk6bxf5so1CWBiQGTIM2bL987QNS",
         },
+        .panthera = .{
+            .url = "git+https://codeberg.org/shar/panthera#3783687c53559aa6138e4e4c29788ef041d4a9bd",
+            .hash = "panthera-0.0.0-GJ5Ew78fAQBLi3iS4D4V4iyOHp1lzN0ZHfRk2A9h4F8m",
+        },
     },
     .paths = .{
         "build.zig",

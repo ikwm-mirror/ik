@@ -2,6 +2,9 @@ const std = @import("std");
 const swc = @import("swc");
 const bsp = @import("bsp.zig");
 const ipc = @import("ipc.zig");
+const query = @import("query.zig");
+const sub = @import("subscriber.zig");
+const panthera = @import("panthera");
 
 // --- State ---
 
@@ -58,10 +61,37 @@ pub const Grab = struct {
     c: ?*Client = null,
 };
 
+// --- Keybinds ---
+
+const MAX_MODES = 32;
+const MODE_NAME_MAX = 64;
+
+const Bind = struct {
+    mods: u32,
+    sym: u32,
+    command: []u8,
+    mode_idx: usize,
+    link: swc.struct_wl_list,
+};
+
+const Mode = struct {
+    name: [MODE_NAME_MAX]u8 = std.mem.zeroes([MODE_NAME_MAX]u8),
+    name_len: usize = 0,
+    binds: swc.struct_wl_list = undefined,
+};
+
+// --- Workspace ---
+
 const Workspace = struct {
     tree: bsp.Tree,
     focused_node: ?*bsp.Node = null,
     clients: swc.struct_wl_list = undefined,
+
+    fn init(alloc: std.mem.Allocator) Workspace {
+        var ws = Workspace{ .tree = bsp.Tree.init(alloc) };
+        swc.wl_list_init(&ws.clients);
+        return ws;
+    }
 
     fn deinit(self: *Workspace) void {
         self.tree.deinit();
@@ -86,6 +116,12 @@ pub const Wm = struct {
 
     retile_pending: bool = false,
     retile_idle: ?*swc.wl_event_source = null,
+
+    modes: [MAX_MODES]Mode,
+    mode_count: usize,
+    mode_idx: usize,
+
+    subscribers: sub.Registry,
 };
 
 // --- Globals ---
@@ -124,24 +160,19 @@ fn isWsClient(cl: *const Client, ws: u32) bool {
     return cl.ws == ws;
 }
 
-// --- App Name ---
+// --- Cache Names ---
 
 fn procName(cl: *Client) []const u8 {
     if (cl.proc_name_len > 0) return cl.proc_name[0..cl.proc_name_len];
-
     const pid = swc.swc_window_get_pid(cl.win);
     if (pid <= 0) return &.{};
-
     var path_buf: [64:0]u8 = undefined;
     _ = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pid}) catch return &.{};
-
     const fd = swc.open(&path_buf, swc.O_RDONLY, @as(c_int, 0));
     if (fd < 0) return &.{};
     defer _ = swc.close(fd);
-
     const n = swc.read(fd, &cl.proc_name, cl.proc_name.len - 1);
     if (n <= 0) return &.{};
-
     var len: usize = @intCast(n);
     while (len > 0 and cl.proc_name[len - 1] == '\n') len -= 1;
     cl.proc_name[len] = 0;
@@ -165,7 +196,6 @@ fn applyDecor(cl: *Client, active: bool) void {
     cl.decor.color = 0xff232136;
     cl.decor.top = 22;
     cl.decor.title.enabled = false;
-
     const name = procName(cl);
     if (name.len > 0) {
         cl.decor.title.string = @ptrCast(&cl.proc_name);
@@ -185,10 +215,6 @@ fn setDecorFocused(enabled: bool) void {
     scheduleRetile();
 }
 
-fn setDecorGlobal(enabled: bool) void {
-    wm.cfg.decor_default = enabled;
-}
-
 // --- Borders ---
 
 fn setBorder(cl: *Client, active: bool) void {
@@ -203,9 +229,7 @@ fn setBorder(cl: *Client, active: bool) void {
 }
 
 fn focus(cl: ?*Client) void {
-    if (wm.sel_client) |prev| {
-        setBorder(prev, false);
-    }
+    if (wm.sel_client) |prev| setBorder(prev, false);
     if (cl) |next| {
         setBorder(next, true);
         swc.swc_window_focus(next.win);
@@ -214,6 +238,7 @@ fn focus(cl: ?*Client) void {
         swc.swc_window_focus(null);
     }
     wm.sel_client = cl;
+    notify(sub.EVT_FOCUS);
 }
 
 // --- Retile ---
@@ -222,11 +247,7 @@ fn scheduleRetile() void {
     if (wm.retile_pending) return;
     wm.retile_pending = true;
     if (wm.retile_idle == null) {
-        wm.retile_idle = swc.wl_event_loop_add_idle(
-            wm.ev_loop,
-            doRetileIdle,
-            null,
-        );
+        wm.retile_idle = swc.wl_event_loop_add_idle(wm.ev_loop, doRetileIdle, null);
     }
 }
 
@@ -237,7 +258,7 @@ fn doRetileIdle(_: ?*anyopaque) callconv(.c) void {
 }
 
 fn retile(ws_idx: ?usize) void {
-    var ws = if (ws_idx) |wid| &wm.workspaces[wid] else curWs();
+    const ws = if (ws_idx) |wid| &wm.workspaces[wid] else curWs();
     const scr = wm.sel_screen orelse return;
     ws.tree.layout(
         scr.scr.geometry.x,
@@ -263,6 +284,362 @@ fn syncWindowVisibility() void {
     }
 }
 
+// --- Notify / Follow ---
+
+fn notify(evt_mask: u32) void {
+    if (wm.subscribers.head == null) return;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [32768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    if (evt_mask & sub.EVT_WORKSPACE != 0) {
+        const payload = buildWorkspacesJson(a) catch return;
+        const env = query.EventEnvelope(query.WorkspacesJson){ .event = "workspace_change", .data = payload };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        wm.subscribers.emit(sub.EVT_WORKSPACE, w.buffered());
+        w = .fixed(&buf);
+    }
+
+    if (evt_mask & sub.EVT_FOCUS != 0) {
+        const payload = buildFocusedJson(a) catch return;
+        const env = query.EventEnvelope(query.FocusedJson){ .event = "focus_change", .data = payload };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        wm.subscribers.emit(sub.EVT_FOCUS, w.buffered());
+        w = .fixed(&buf);
+    }
+
+    if (evt_mask & sub.EVT_CLIENT != 0) {
+        const payload = buildClientsJson(a, .all) catch return;
+        const env = query.EventEnvelope(query.ClientsJson){ .event = "client_change", .data = payload };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        wm.subscribers.emit(sub.EVT_CLIENT, w.buffered());
+        w = .fixed(&buf);
+    }
+
+    if (evt_mask & sub.EVT_MODE != 0) {
+        const payload = buildModeJson(a) catch return;
+        const env = query.EventEnvelope(query.ModeJson){ .event = "mode_change", .data = payload };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        wm.subscribers.emit(sub.EVT_MODE, w.buffered());
+        w = .fixed(&buf);
+    }
+
+    if (evt_mask & sub.EVT_CONFIG != 0) {
+        const payload = buildConfigJson();
+        const env = query.EventEnvelope(query.ConfigJson){ .event = "config_change", .data = payload };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        wm.subscribers.emit(sub.EVT_CONFIG, w.buffered());
+    }
+}
+
+// TODO: Split all of this into separate files
+
+// --- JSON ---
+
+fn clientToJson(cl: *Client) query.ClientJson {
+    const node = cl.bsp_node;
+    return .{
+        .pid = swc.swc_window_get_pid(cl.win),
+        .workspace = cl.ws,
+        .floating = cl.floating,
+        .fullscreen = cl.fullscreen,
+        .decor_enabled = cl.decor_enabled,
+        .focused = wm.sel_client == cl,
+        .x = if (node) |n| n.x else cl.fx,
+        .y = if (node) |n| n.y else cl.fy,
+        .w = if (node) |n| n.w else cl.fw,
+        .h = if (node) |n| n.h else cl.fh,
+        .name = procName(cl),
+    };
+}
+
+fn buildFocusedJson(_: std.mem.Allocator) !query.FocusedJson {
+    const cl = wm.sel_client orelse return .{
+        .pid = -1,
+        .workspace = 0,
+        .floating = false,
+        .fullscreen = false,
+        .decor_enabled = false,
+        .focused = false,
+        .x = 0,
+        .y = 0,
+        .w = 0,
+        .h = 0,
+        .name = "",
+        .none = true,
+    };
+    const j = clientToJson(cl);
+    return .{
+        .pid = j.pid,
+        .workspace = j.workspace,
+        .floating = j.floating,
+        .fullscreen = j.fullscreen,
+        .decor_enabled = j.decor_enabled,
+        .focused = j.focused,
+        .x = j.x,
+        .y = j.y,
+        .w = j.w,
+        .h = j.h,
+        .name = j.name,
+        .none = false,
+    };
+}
+
+fn buildWorkspacesJson(a: std.mem.Allocator) !query.WorkspacesJson {
+    var list: std.ArrayListUnmanaged(query.WorkspaceJson) = .empty;
+    var i: u32 = 0;
+    while (i < wm.cfg.workspace_count) : (i += 1) {
+        const head = wsClients(i);
+        var count: u32 = 0;
+        var it: ?*swc.struct_wl_list = head.next;
+        while (it != head) : (it = it.?.next) count += 1;
+        try list.append(a, .{
+            .index = i + 1,
+            .focused = (i + 1 == wm.ws),
+            .client_count = count,
+        });
+    }
+    return .{
+        .workspaces = try list.toOwnedSlice(a),
+        .current = wm.ws,
+        .count = wm.cfg.workspace_count,
+    };
+}
+
+fn buildClientsJson(a: std.mem.Allocator, scope: ipc.ClientScope) !query.ClientsJson {
+    var list: std.ArrayListUnmanaged(query.ClientJson) = .empty;
+    switch (scope) {
+        .current => return .{ .clients = try list.toOwnedSlice(a), .workspace = wm.ws },
+        .all => return .{ .clients = try list.toOwnedSlice(a), .workspace = 0 },
+    }
+}
+
+fn buildModeJson(a: std.mem.Allocator) !query.ModeJson {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (wm.modes[0..wm.mode_count]) |*m| {
+        try names.append(a, m.name[0..m.name_len]);
+    }
+    return .{
+        .current = wm.modes[wm.mode_idx].name[0..wm.modes[wm.mode_idx].name_len],
+        .all = try names.toOwnedSlice(a),
+    };
+}
+
+fn buildConfigJson() query.ConfigJson {
+    return .{
+        .border_width = wm.cfg.border_width,
+        .border_outer_width = wm.cfg.border_outer_width,
+        .border_color_active = wm.cfg.border_color_active,
+        .border_color_normal = wm.cfg.border_color_normal,
+        .border_outer_color_active = wm.cfg.border_outer_color_active,
+        .border_outer_color_normal = wm.cfg.border_outer_color_normal,
+        .wallpaper_color = wm.cfg.wallpaper_color,
+        .gap_inner = wm.cfg.gap_inner,
+        .gap_outer = wm.cfg.gap_outer,
+        .motion_throttle_hz = wm.cfg.motion_throttle_hz,
+        .decor_default = wm.cfg.decor_default,
+        .workspace_count = wm.cfg.workspace_count,
+    };
+}
+
+fn buildStatusJson(a: std.mem.Allocator) !query.StatusJson {
+    return .{
+        .workspaces = try buildWorkspacesJson(a),
+        .focused = try buildFocusedJson(a),
+        .clients = (try buildClientsJson(a, .all)).clients,
+        .mode = wm.modes[wm.mode_idx].name[0..wm.modes[wm.mode_idx].name_len],
+    };
+}
+
+// --- Query Dispatch ---
+
+fn dispatchQuery(cmd: ipc.QueryCmd, fd: c_int) void {
+    if (fd < 0) return;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [32768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    switch (cmd) {
+        .focused => {
+            const j = buildFocusedJson(a) catch return;
+            panthera.stringify(j, .{}, &w) catch return;
+        },
+        .workspaces => {
+            const j = buildWorkspacesJson(a) catch return;
+            panthera.stringify(j, .{}, &w) catch return;
+        },
+        .clients => |scope| {
+            const j = buildClientsJson(a, scope) catch return;
+            panthera.stringify(j, .{}, &w) catch return;
+        },
+        .mode => {
+            const j = buildModeJson(a) catch return;
+            panthera.stringify(j, .{}, &w) catch return;
+        },
+        .config => {
+            const j = buildConfigJson();
+            panthera.stringify(j, .{}, &w) catch return;
+        },
+        .status => {
+            const j = buildStatusJson(a) catch return;
+            panthera.stringify(j, .{}, &w) catch return;
+        },
+        .binds => |name| {
+            writeBindsJson(name, &w) catch return;
+        },
+    }
+
+    _ = w.writeByte('\n') catch {};
+    const out = w.buffered();
+    _ = swc.write(fd, out.ptr, out.len);
+}
+
+const BindJson = struct { mode: []const u8, mods: u32, sym: u32, command: []const u8 };
+
+fn writeBindsJson(mode_name: []const u8, w: *std.Io.Writer) !void {
+    const mode_idx = findMode(mode_name) orelse return;
+    const m = &wm.modes[mode_idx];
+
+    var list: [256]BindJson = undefined;
+    var count: usize = 0;
+
+    var it: ?*swc.struct_wl_list = m.binds.next;
+    while (it != &m.binds and count < list.len) : (it = it.?.next) {
+        const b: *Bind = @fieldParentPtr("link", it.?);
+        list[count] = .{
+            .mode = m.name[0..m.name_len],
+            .mods = b.mods,
+            .sym = b.sym,
+            .command = b.command,
+        };
+        count += 1;
+    }
+
+    try panthera.stringify(list[0..count], .{}, w);
+}
+
+// --- Keybind (Modal) ---
+
+fn modeName(m: *const Mode) []const u8 {
+    return m.name[0..m.name_len];
+}
+
+fn findMode(name: []const u8) ?usize {
+    for (wm.modes[0..wm.mode_count], 0..) |*m, i| {
+        if (std.mem.eql(u8, modeName(m), name)) return i;
+    }
+    return null;
+}
+
+fn defineMode(name: []const u8) !usize {
+    if (findMode(name)) |i| return i;
+    if (wm.mode_count >= MAX_MODES) return error.OutOfMemory;
+    const idx = wm.mode_count;
+    wm.mode_count += 1;
+    const m = &wm.modes[idx];
+    m.* = .{};
+    const copy_len = @min(name.len, MODE_NAME_MAX - 1);
+    @memcpy(m.name[0..copy_len], name[0..copy_len]);
+    m.name_len = copy_len;
+    swc.wl_list_init(&m.binds);
+    return idx;
+}
+
+fn onKeyFire(data: ?*anyopaque, _: u32, _: u32, state: u32) callconv(.c) void {
+    if (state != 1) return;
+    const bind: *Bind = @ptrCast(@alignCast(data orelse return));
+    if (bind.mode_idx != wm.mode_idx) return;
+    const cmd = ipc.parse(bind.command) catch return;
+    dispatchCmd(cmd, -1);
+}
+
+fn registerBind(bind: *Bind) void {
+    _ = swc.swc_add_binding(
+        swc.SWC_BINDING_KEY,
+        bind.mods,
+        bind.sym,
+        onKeyFire,
+        bind,
+    );
+}
+
+fn activateMode(idx: usize) void {
+    wm.mode_idx = idx;
+    notify(sub.EVT_MODE);
+}
+
+fn addBind(def: ipc.BindDef) void {
+    const mode_idx = defineMode(def.mode) catch return;
+    const m = &wm.modes[mode_idx];
+
+    var it: ?*swc.struct_wl_list = m.binds.next;
+    while (it != &m.binds) : (it = it.?.next) {
+        const b: *Bind = @fieldParentPtr("link", it.?);
+        if (b.mods == def.key.mods and b.sym == def.key.sym) {
+            gpa.free(b.command);
+            swc.wl_list_remove(&b.link);
+            gpa.destroy(b);
+            break;
+        }
+    }
+
+    const bind = gpa.create(Bind) catch return;
+    bind.* = .{
+        .mods = def.key.mods,
+        .sym = def.key.sym,
+        .command = gpa.dupe(u8, def.command) catch {
+            gpa.destroy(bind);
+            return;
+        },
+        .mode_idx = mode_idx,
+        .link = undefined,
+    };
+    swc.wl_list_insert(&m.binds, &bind.link);
+    registerBind(bind); // always register; handler gates on mode_idx
+}
+
+fn destroyMode(idx: usize) void {
+    if (idx == 0) return;
+    const m = &wm.modes[idx];
+    if (wm.mode_idx == idx) activateMode(0);
+    while (swc.wl_list_empty(&m.binds) == 0) {
+        const next_ptr: *swc.struct_wl_list = @ptrCast(m.binds.next.?);
+        const b: *Bind = @fieldParentPtr("link", next_ptr);
+        gpa.free(b.command);
+        swc.wl_list_remove(&b.link);
+        gpa.destroy(b);
+    }
+    var i = idx;
+    while (i + 1 < wm.mode_count) : (i += 1) wm.modes[i] = wm.modes[i + 1];
+    wm.mode_count -= 1;
+    if (wm.mode_idx > idx) wm.mode_idx -= 1;
+}
+
+fn freeAllModes() void {
+    for (wm.modes[0..wm.mode_count]) |*m| {
+        while (swc.wl_list_empty(&m.binds) == 0) {
+            const next_ptr: *swc.struct_wl_list = @ptrCast(m.binds.next.?);
+            const b: *Bind = @fieldParentPtr("link", next_ptr);
+            gpa.free(b.command);
+            swc.wl_list_remove(&b.link);
+            gpa.destroy(b);
+        }
+    }
+}
+
 // --- Hardware ---
 
 pub fn newScreen(scr: ?*swc.swc_screen) callconv(.c) void {
@@ -277,10 +654,7 @@ fn onScreenDestroy(data: ?*anyopaque) callconv(.c) void {
     const s: *Screen = @ptrCast(@alignCast(data orelse return));
     swc.wl_list_remove(&s.link);
     if (wm.sel_screen == s) {
-        wm.sel_screen = if (swc.wl_list_empty(&wm.screens) != 0)
-            null
-        else
-            @fieldParentPtr("link", @as(*swc.struct_wl_list, @ptrCast(wm.screens.next)));
+        wm.sel_screen = if (swc.wl_list_empty(&wm.screens) != 0) null else @fieldParentPtr("link", @as(*swc.struct_wl_list, @ptrCast(wm.screens.next)));
     }
     gpa.destroy(s);
 }
@@ -302,7 +676,6 @@ pub fn onDeactivate() callconv(.c) void {}
 
 pub fn newWindow(win: ?*swc.swc_window) callconv(.c) void {
     const w = win orelse return;
-
     const cl: *Client = gpa.create(Client) catch @panic("OOM");
     cl.* = .{
         .win = w,
@@ -312,7 +685,6 @@ pub fn newWindow(win: ?*swc.swc_window) callconv(.c) void {
         .ws = wm.ws,
         .decor_enabled = wm.cfg.decor_default,
     };
-
     w.motion_throttle_ms = 1000 / wm.cfg.motion_throttle_hz;
     w.min_width = 1;
     w.min_height = 1;
@@ -331,11 +703,11 @@ pub fn newWindow(win: ?*swc.swc_window) callconv(.c) void {
     swc.swc_window_show(w);
     focus(cl);
     scheduleRetile();
+    notify(sub.EVT_CLIENT | sub.EVT_WORKSPACE);
 }
 
 fn onWinDestroy(data: ?*anyopaque) callconv(.c) void {
     const cl: *Client = @ptrCast(@alignCast(data orelse return));
-
     if (wm.grab.active and wm.grab.c == cl) wm.grab = .{};
 
     const cl_ws = cl.ws;
@@ -344,18 +716,12 @@ fn onWinDestroy(data: ?*anyopaque) callconv(.c) void {
     if (!cl_floating) {
         const ws = &wm.workspaces[cl_ws - 1];
         if (cl.bsp_node) |n| {
-            // pick the sibling to focus after removal
             const sibling: ?*bsp.Node = blk: {
                 const p = n.parent orelse break :blk null;
                 break :blk if (p.left == n) p.right else p.left;
             };
             ws.tree.remove(n);
-            ws.focused_node = if (sibling) |s|
-                bsp.Tree.firstLeaf(s)
-            else if (ws.tree.root) |r|
-                bsp.Tree.firstLeaf(r)
-            else
-                null;
+            ws.focused_node = if (sibling) |s| bsp.Tree.firstLeaf(s) else if (ws.tree.root) |r| bsp.Tree.firstLeaf(r) else null;
         }
     }
 
@@ -375,6 +741,7 @@ fn onWinDestroy(data: ?*anyopaque) callconv(.c) void {
         gpa.destroy(cl);
         if (cl_ws == wm.ws) scheduleRetile();
     }
+    notify(sub.EVT_CLIENT | sub.EVT_WORKSPACE);
 }
 
 fn onWinEntered(data: ?*anyopaque) callconv(.c) void {
@@ -405,13 +772,11 @@ fn ipcSetup() !void {
     var addr: swc.sockaddr_un = undefined;
     @memset(std.mem.asBytes(&addr), 0);
     addr.sun_family = swc.AF_UNIX;
-
     const max_len = @typeInfo(@TypeOf(addr.sun_path)).array.len - 1;
     const copy_len = @min(path.len, max_len);
     @memcpy(addr.sun_path[0..copy_len], path[0..copy_len]);
     addr.sun_path[copy_len] = 0;
 
-    // retry once to recover from a stale socket left by a previous crash
     if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0) {
         _ = swc.unlink(@ptrCast(&addr.sun_path));
         if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0)
@@ -471,6 +836,8 @@ fn ipcRead(_: c_int, _: u32, data: ?*anyopaque) callconv(.c) c_int {
     var buf: [4096]u8 = undefined;
     const n = swc.read(fd, &buf, buf.len - 1);
 
+    var became_subscriber = false;
+
     if (n > 0) {
         const bytes = buf[0..@as(usize, @intCast(n))];
         var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -484,138 +851,287 @@ fn ipcRead(_: c_int, _: u32, data: ?*anyopaque) callconv(.c) c_int {
                     error.BadInteger => "error: bad integer\n",
                     error.BadFloat => "error: bad float\n",
                     error.BadColor => "error: bad color\n",
+                    error.BadKey => "error: bad key\n",
                 };
                 _ = swc.send(fd, msg.ptr, msg.len, swc.MSG_NOSIGNAL);
                 continue;
             };
+
+            if (cmd == .follow) {
+                wm.subscribers.add(fd, cmd.follow.mask, ipc_conn.source);
+                gpa.destroy(ipc_conn);
+                became_subscriber = true;
+                sendInitialSnapshot(fd, cmd.follow.mask);
+                break;
+            }
+
             dispatchCmd(cmd, fd);
         }
     }
 
-    _ = swc.wl_event_source_remove(ipc_conn.source);
-    gpa.destroy(ipc_conn);
-    _ = swc.close(fd);
+    if (!became_subscriber) {
+        _ = swc.wl_event_source_remove(ipc_conn.source);
+        gpa.destroy(ipc_conn);
+        _ = swc.close(fd);
+    }
+
     return 0;
 }
 
+fn sendInitialSnapshot(fd: c_int, mask: u32) void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [32768]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    if (mask & sub.EVT_WORKSPACE != 0) {
+        const j = buildWorkspacesJson(a) catch return;
+        const env = query.EventEnvelope(query.WorkspacesJson){ .event = "workspace_change", .data = j };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        _ = swc.write(fd, w.buffered().ptr, w.buffered().len);
+        w = .fixed(&buf);
+    }
+    if (mask & sub.EVT_FOCUS != 0) {
+        const j = buildFocusedJson(a) catch return;
+        const env = query.EventEnvelope(query.FocusedJson){ .event = "focus_change", .data = j };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        _ = swc.write(fd, w.buffered().ptr, w.buffered().len);
+        w = .fixed(&buf);
+    }
+    if (mask & sub.EVT_CLIENT != 0) {
+        const j = buildClientsJson(a, .all) catch return;
+        const env = query.EventEnvelope(query.ClientsJson){ .event = "client_change", .data = j };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        _ = swc.write(fd, w.buffered().ptr, w.buffered().len);
+        w = .fixed(&buf);
+    }
+    if (mask & sub.EVT_MODE != 0) {
+        const j = buildModeJson(a) catch return;
+        const env = query.EventEnvelope(query.ModeJson){ .event = "mode_change", .data = j };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        _ = swc.write(fd, w.buffered().ptr, w.buffered().len);
+        w = .fixed(&buf);
+    }
+    if (mask & sub.EVT_CONFIG != 0) {
+        const j = buildConfigJson();
+        const env = query.EventEnvelope(query.ConfigJson){ .event = "config_change", .data = j };
+        panthera.stringify(env, .{}, &w) catch return;
+        _ = w.writeByte('\n') catch {};
+        _ = swc.write(fd, w.buffered().ptr, w.buffered().len);
+    }
+}
+
+// --- Dispatch ---
+
 fn dispatchCmd(cmd: ipc.Command, reply_fd: c_int) void {
     switch (cmd) {
-        .focus_next => moveFocus(1),
-        .focus_prev => moveFocus(-1),
-        .focus_dir => |d| focusDir(d),
-        .kill => {
+        .node => |c| dispatchNode(c),
+        .desktop => |c| dispatchDesktop(c),
+        .config => |c| dispatchConfig(c, reply_fd),
+        .bind => |c| dispatchBind(c, reply_fd),
+        .mode => |c| dispatchMode(c),
+        .wm => |c| dispatchWm(c),
+        .query => |c| dispatchQuery(c, reply_fd),
+        .follow => {},
+    }
+}
+
+fn dispatchNode(cmd: ipc.NodeCmd) void {
+    switch (cmd) {
+        .focus => |t| moveFocus(t),
+        .swap => |t| swapNode(t),
+        .kill, .close => {
             if (wm.sel_client) |cl| swc.swc_window_close(cl.win);
         },
         .fullscreen => toggleFullscreen(),
         .floating => setFloating(true),
         .tiling => setFloating(false),
-        .split => |dir| setSplit(dir),
-        .ratio => |r| setRatio(r),
         .rotate => rotateSplit(),
+        .ratio => |r| setRatio(r),
+        .split => |d| setSplit(d),
+    }
+}
 
-        .gap_inner => |v| {
-            wm.cfg.gap_inner = v;
-            scheduleRetile();
-        },
-        .gap_outer => |v| {
-            wm.cfg.gap_outer = v;
-            scheduleRetile();
-        },
+fn dispatchDesktop(cmd: ipc.DesktopCmd) void {
+    switch (cmd) {
+        .focus => |n| gotoWs(n),
+        .send => |n| moveToWs(n),
+        .count => |n| setWorkspaceCount(n),
+    }
+}
 
+fn dispatchConfig(cmd: ipc.ConfigCmd, reply_fd: c_int) void {
+    switch (cmd) {
+        .get => |key| replyConfig(key, reply_fd),
+        .set => |s| applyConfig(s),
+    }
+}
+
+fn replyConfig(key: ipc.ConfigKey, fd: c_int) void {
+    if (fd < 0) return;
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const cfg = &wm.cfg;
+    const field_name = @tagName(key);
+    w.writeAll("{\"") catch return;
+    w.writeAll(field_name) catch return;
+    w.writeAll("\":") catch return;
+    switch (key) {
+        .border_width => w.print("{d}", .{cfg.border_width}) catch return,
+        .border_outer_width => w.print("{d}", .{cfg.border_outer_width}) catch return,
+        .border_color_active => w.print("{x:0>8}", .{cfg.border_color_active}) catch return,
+        .border_color_normal => w.print("{x:0>8}", .{cfg.border_color_normal}) catch return,
+        .border_outer_color_active => w.print("{x:0>8}", .{cfg.border_outer_color_active}) catch return,
+        .border_outer_color_normal => w.print("{x:0>8}", .{cfg.border_outer_color_normal}) catch return,
+        .gap_inner => w.print("{d}", .{cfg.gap_inner}) catch return,
+        .gap_outer => w.print("{d}", .{cfg.gap_outer}) catch return,
+        .wallpaper_color => w.print("{x:0>8}", .{cfg.wallpaper_color}) catch return,
+        .decor => {
+            if (wm.sel_client) |cl| w.print("{}", .{cl.decor_enabled}) catch return else w.writeAll("null") catch return;
+        },
+        .decor_default => w.print("{}", .{cfg.decor_default}) catch return,
+        .workspace_count => w.print("{d}", .{cfg.workspace_count}) catch return,
+        .motion_throttle_hz => w.print("{d}", .{cfg.motion_throttle_hz}) catch return,
+    }
+    w.writeAll("}\n") catch return;
+    const out = w.buffered();
+    _ = swc.write(fd, out.ptr, out.len);
+}
+
+fn applyConfig(s: ipc.ConfigSet) void {
+    const cfg = &wm.cfg;
+    switch (s) {
         .border_width => |v| {
-            wm.cfg.border_width = v;
+            cfg.border_width = v;
             reapplyBorders();
         },
         .border_outer_width => |v| {
-            wm.cfg.border_outer_width = v;
+            cfg.border_outer_width = v;
             reapplyBorders();
         },
         .border_color_active => |v| {
-            wm.cfg.border_color_active = v;
+            cfg.border_color_active = v;
             reapplyBorders();
         },
         .border_color_normal => |v| {
-            wm.cfg.border_color_normal = v;
+            cfg.border_color_normal = v;
             reapplyBorders();
         },
         .border_outer_color_active => |v| {
-            wm.cfg.border_outer_color_active = v;
+            cfg.border_outer_color_active = v;
             reapplyBorders();
         },
         .border_outer_color_normal => |v| {
-            wm.cfg.border_outer_color_normal = v;
+            cfg.border_outer_color_normal = v;
             reapplyBorders();
         },
-
+        .gap_inner => |v| {
+            cfg.gap_inner = v;
+            scheduleRetile();
+        },
+        .gap_outer => |v| {
+            cfg.gap_outer = v;
+            scheduleRetile();
+        },
         .wallpaper_color => |v| {
-            wm.cfg.wallpaper_color = v;
+            cfg.wallpaper_color = v;
             swc.swc_wallpaper_color_set(v);
         },
+        .decor => |v| setDecorFocused(v),
+        .decor_default => |v| {
+            cfg.decor_default = v;
+        },
+        .workspace_count => |v| setWorkspaceCount(v),
+        .motion_throttle_hz => |v| {
+            cfg.motion_throttle_hz = v;
+        },
+    }
+    notify(sub.EVT_CONFIG);
+}
 
-        .decor_focused => |v| setDecorFocused(v),
-        .decor_global => |v| setDecorGlobal(v),
+fn dispatchBind(cmd: ipc.BindCmd, reply_fd: c_int) void {
+    switch (cmd) {
+        .add => |def| addBind(def),
+        .list => |name| {
+            if (reply_fd < 0) return;
+            var buf: [16384]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            writeBindsJson(name, &w) catch return;
+            _ = w.writeByte('\n') catch {};
+            const out = w.buffered();
+            _ = swc.write(reply_fd, out.ptr, out.len);
+        },
+    }
+}
 
-        .workspace_goto => |n| gotoWs(n),
-        .workspace_move => |n| moveToWs(n),
-        .workspace_count => |n| setWorkspaceCount(n),
+fn dispatchMode(cmd: ipc.ModeCmd) void {
+    switch (cmd) {
+        .enter => |name| {
+            if (findMode(name)) |i| activateMode(i);
+        },
+        .leave => activateMode(0),
+        .define => |name| {
+            _ = defineMode(name) catch {};
+        },
+        .remove => |name| {
+            if (findMode(name)) |i| destroyMode(i);
+        },
+    }
+}
 
-        .spawn => |cmd_str| spawnCmd(cmd_str),
+fn dispatchWm(cmd: ipc.WmCmd) void {
+    switch (cmd) {
         .quit => swc.wl_display_terminate(wm.dpy),
-
-        .query_focused => {
-            if (wm.sel_client) |cl| {
-                const pid = swc.swc_window_get_pid(cl.win);
-                var pbuf: [32]u8 = undefined;
-                const s = std.fmt.bufPrint(&pbuf, "{d}\n", .{pid}) catch return;
-                _ = swc.write(reply_fd, s.ptr, s.len);
-            } else {
-                _ = swc.write(reply_fd, "none\n", 5);
-            }
-        },
-
-        .query_workspaces => {
-            var pbuf: [64]u8 = undefined;
-            const s = std.fmt.bufPrint(&pbuf, "count {d}\ncurrent {d}\n", .{
-                wm.cfg.workspace_count,
-                wm.ws,
-            }) catch return;
-            _ = swc.write(reply_fd, s.ptr, s.len);
-        },
+        .reload => {},
+        .spawn => |s| spawnCmd(s),
     }
 }
 
 // --- Actions ---
 
-fn moveFocus(dir: i32) void {
+fn moveFocus(target: ipc.FocusTarget) void {
+    switch (target) {
+        .next => moveFocusCyclic(1),
+        .prev => moveFocusCyclic(-1),
+        .left => focusDir(.left),
+        .right => focusDir(.right),
+        .up => focusDir(.up),
+        .down => focusDir(.down),
+    }
+}
+
+fn moveFocusCyclic(dir: i32) void {
     const head = wsClients(wm.ws - 1);
     if (swc.wl_list_empty(head) != 0) return;
-
     const sel = wm.sel_client orelse {
         focus(firstWsClient(wm.ws));
         return;
     };
-
     const next_link = if (dir > 0) sel.ws_link.next else sel.ws_link.prev;
     const target_link = if (next_link == head)
-        (if (dir > 0) head.next else head.prev) // wrap around
+        (if (dir > 0) head.next else head.prev)
     else
         next_link;
-
     if (target_link == head) return;
-    const target_ptr: *swc.struct_wl_list = @ptrCast(target_link.?);
-    focus(@fieldParentPtr("ws_link", target_ptr));
+    const next_ptr: *swc.struct_wl_list = @ptrCast(target_link.?);
+    focus(@fieldParentPtr("ws_link", next_ptr));
 }
 
-fn focusDir(dir: ipc.Command.Dir) void {
+fn focusDir(dir: ipc.FocusTarget) void {
     const sel = wm.sel_client orelse {
-        moveFocus(1);
+        moveFocusCyclic(1);
         return;
     };
     const sel_node = sel.bsp_node orelse {
-        moveFocus(1);
+        moveFocusCyclic(1);
         return;
     };
-
     const sel_cx: i32 = sel_node.x + @as(i32, @intCast(sel_node.w / 2));
     const sel_cy: i32 = sel_node.y + @as(i32, @intCast(sel_node.h / 2));
 
@@ -630,7 +1146,6 @@ fn focusDir(dir: ipc.Command.Dir) void {
         const n = cl.bsp_node.?;
         const cx: i32 = n.x + @as(i32, @intCast(n.w / 2));
         const cy: i32 = n.y + @as(i32, @intCast(n.h / 2));
-
         const dist: i32 = switch (dir) {
             .left => blk: {
                 if (cx >= sel_cx) continue;
@@ -648,6 +1163,7 @@ fn focusDir(dir: ipc.Command.Dir) void {
                 if (cy <= sel_cy) continue;
                 break :blk cy - sel_cy;
             },
+            else => continue,
         };
         if (dist < best_dist) {
             best_dist = dist;
@@ -655,22 +1171,69 @@ fn focusDir(dir: ipc.Command.Dir) void {
         }
     }
 
-    if (best) |b| focus(b) else moveFocus(1);
+    if (best) |b| focus(b) else moveFocusCyclic(1);
+}
+
+fn swapNode(target: ipc.FocusTarget) void {
+    const sel = wm.sel_client orelse return;
+    const sel_n = sel.bsp_node orelse return;
+    const sel_cx: i32 = sel_n.x + @as(i32, @intCast(sel_n.w / 2));
+    const sel_cy: i32 = sel_n.y + @as(i32, @intCast(sel_n.h / 2));
+
+    var best: ?*Client = null;
+    var best_dist: i32 = std.math.maxInt(i32);
+
+    const head = wsClients(wm.ws - 1);
+    var it: ?*swc.struct_wl_list = head.next;
+    while (it != head) : (it = it.?.next) {
+        const cl: *Client = @fieldParentPtr("ws_link", it.?);
+        if (cl == sel or cl.floating or cl.bsp_node == null) continue;
+        const n = cl.bsp_node.?;
+        const cx: i32 = n.x + @as(i32, @intCast(n.w / 2));
+        const cy: i32 = n.y + @as(i32, @intCast(n.h / 2));
+        const dist: i32 = switch (target) {
+            .left => blk: {
+                if (cx >= sel_cx) continue;
+                break :blk sel_cx - cx;
+            },
+            .right => blk: {
+                if (cx <= sel_cx) continue;
+                break :blk cx - sel_cx;
+            },
+            .up => blk: {
+                if (cy >= sel_cy) continue;
+                break :blk sel_cy - cy;
+            },
+            .down => blk: {
+                if (cy <= sel_cy) continue;
+                break :blk cy - sel_cy;
+            },
+            .next, .prev => @intCast((@intFromPtr(cl) >> 4) & 0xffff),
+        };
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = cl;
+        }
+    }
+
+    const other = best orelse return;
+    const other_n = other.bsp_node orelse return;
+    sel_n.client = other;
+    other_n.client = sel;
+    sel.bsp_node = other_n;
+    other.bsp_node = sel_n;
+    scheduleRetile();
+    notify(sub.EVT_CLIENT);
 }
 
 fn toggleFullscreen() void {
     const cl = wm.sel_client orelse return;
     const scr = cl.scr orelse return;
-
     if (cl.fullscreen) {
         cl.fullscreen = false;
         swc.swc_window_set_stacked(cl.win);
         applyDecor(cl, true);
-        if (!cl.floating) {
-            scheduleRetile();
-        } else if (cl.fw > 0) {
-            swc.swc_window_set_geometry(cl.win, &.{ .x = cl.fx, .y = cl.fy, .width = cl.fw, .height = cl.fh });
-        }
+        if (!cl.floating) scheduleRetile() else if (cl.fw > 0) swc.swc_window_set_geometry(cl.win, &.{ .x = cl.fx, .y = cl.fy, .width = cl.fw, .height = cl.fh });
     } else {
         var geom: swc.swc_rectangle = undefined;
         if (swc.swc_window_get_geometry(cl.win, &geom)) {
@@ -683,12 +1246,12 @@ fn toggleFullscreen() void {
         applyDecor(cl, true);
         swc.swc_window_set_fullscreen(cl.win, scr.scr);
     }
+    notify(sub.EVT_CLIENT);
 }
 
 fn setFloating(floating: bool) void {
     const cl = wm.sel_client orelse return;
     if (cl.floating == floating) return;
-
     if (floating) {
         if (cl.bsp_node) |n| {
             const ws = &wm.workspaces[cl.ws - 1];
@@ -708,6 +1271,7 @@ fn setFloating(floating: bool) void {
         swc.swc_window_set_tiled(cl.win);
         scheduleRetile();
     }
+    notify(sub.EVT_CLIENT);
 }
 
 fn setSplit(dir: bsp.Dir) void {
@@ -736,7 +1300,6 @@ fn rotateSplit() void {
 
 fn reapplyBorders() void {
     const head = wsClients(wm.ws - 1);
-    if (swc.wl_list_empty(head) != 0) return;
     var it: ?*swc.struct_wl_list = head.next;
     while (it != head) : (it = it.?.next) {
         const cl: *Client = @fieldParentPtr("ws_link", it.?);
@@ -765,7 +1328,6 @@ fn moveToWs(n: u32) void {
         }
     }
     swc.wl_list_remove(&cl.ws_link);
-
     cl.ws = n;
     swc.wl_list_insert(wsClients(n - 1), &cl.ws_link);
 
@@ -776,9 +1338,9 @@ fn moveToWs(n: u32) void {
     }
 
     if (cl.ws != wm.ws) swc.swc_window_hide(cl.win) else swc.swc_window_show(cl.win);
-
     scheduleRetile();
     focus(firstWsClient(wm.ws));
+    notify(sub.EVT_WORKSPACE | sub.EVT_CLIENT);
 }
 
 fn setWorkspaceCount(count: u32) void {
@@ -787,14 +1349,12 @@ fn setWorkspaceCount(count: u32) void {
     if (new_count == old_count) return;
 
     if (new_count < old_count) {
-        // evacuate clients from removed workspaces into the new last one
         var ws_idx: u32 = new_count;
         while (ws_idx < old_count) : (ws_idx += 1) {
             const src = &wm.workspaces[ws_idx];
             while (swc.wl_list_empty(&src.clients) == 0) {
                 const next_ptr: *swc.struct_wl_list = @ptrCast(src.clients.next.?);
                 const cl: *Client = @fieldParentPtr("ws_link", next_ptr);
-
                 if (!cl.floating) {
                     if (cl.bsp_node) |leaf| {
                         if (src.focused_node == leaf) src.focused_node = null;
@@ -803,24 +1363,17 @@ fn setWorkspaceCount(count: u32) void {
                     }
                 }
                 swc.wl_list_remove(&cl.ws_link);
-
                 cl.ws = new_count;
                 swc.wl_list_insert(wsClients(new_count - 1), &cl.ws_link);
-
                 if (!cl.floating) {
                     const dst = &wm.workspaces[new_count - 1];
                     const leaf = dst.tree.insert(cl, dst.focused_node) catch continue;
                     cl.bsp_node = leaf;
                     dst.focused_node = leaf;
                 }
-
-                if (cl.ws == wm.ws)
-                    swc.swc_window_show(cl.win)
-                else
-                    swc.swc_window_hide(cl.win);
+                if (cl.ws == wm.ws) swc.swc_window_show(cl.win) else swc.swc_window_hide(cl.win);
             }
         }
-
         if (wm.ws > new_count) {
             wm.ws = new_count;
             syncWindowVisibility();
@@ -830,6 +1383,7 @@ fn setWorkspaceCount(count: u32) void {
     wm.cfg.workspace_count = new_count;
     retile(null);
     focus(firstWsClient(wm.ws));
+    notify(sub.EVT_WORKSPACE | sub.EVT_CONFIG);
 }
 
 fn spawnCmd(cmd_str: []const u8) void {
@@ -837,12 +1391,11 @@ fn spawnCmd(cmd_str: []const u8) void {
     const len = @min(cmd_str.len, buf.len - 1);
     @memcpy(buf[0..len], cmd_str[0..len]);
     buf[len] = 0;
-
     const pid = swc.fork();
     if (pid == 0) {
         _ = swc.setsid();
         var fd: c_int = 3;
-        while (fd < 1024) : (fd += 1) _ = swc.close(fd); // close inherited fds
+        while (fd < 1024) : (fd += 1) _ = swc.close(fd);
         _ = swc.execl("/bin/sh", "/bin/sh", "-c", @as([*:0]const u8, @ptrCast(&buf)), @as(?[*:0]const u8, null));
         swc.exit(1);
     }
@@ -856,7 +1409,16 @@ fn sigHandler(_: c_int) callconv(.c) void {
 
 // --- Setup ---
 
+fn initWorkspaces() void {
+    for (&wm.workspaces) |*ws| {
+        ws.tree = bsp.Tree.init(gpa);
+        ws.focused_node = null;
+        swc.wl_list_init(&ws.clients);
+    }
+}
+
 fn setup() !void {
+    wm.subscribers = sub.Registry.init(gpa);
     wm.dpy = swc.wl_display_create() orelse return error.DisplayCreate;
     wm.ev_loop = swc.wl_display_get_event_loop(wm.dpy) orelse return error.EventLoop;
 
@@ -869,15 +1431,14 @@ fn setup() !void {
     wm.cfg = .{};
     wm.retile_pending = false;
     wm.retile_idle = null;
+    wm.mode_count = 0;
+    wm.mode_idx = 0;
 
-    for (&wm.workspaces) |*ws| {
-        ws.tree = bsp.Tree.init(gpa);
-        ws.focused_node = null;
-        swc.wl_list_init(&ws.clients);
-    }
+    _ = try defineMode("default");
+
+    initWorkspaces();
 
     if (!swc.swc_initialize(wm.dpy, wm.ev_loop, &manager)) {
-        // swc mey have called newScreen before failing; clean up
         while (swc.wl_list_empty(&wm.screens) == 0) {
             const next_ptr: *swc.struct_wl_list = @ptrCast(wm.screens.next.?);
             const s: *Screen = @fieldParentPtr("link", next_ptr);
@@ -889,8 +1450,7 @@ fn setup() !void {
 
     swc.swc_wallpaper_color_set(wm.cfg.wallpaper_color);
 
-    const sock = swc.wl_display_add_socket_auto(wm.dpy) orelse
-        return error.Socket;
+    const sock = swc.wl_display_add_socket_auto(wm.dpy) orelse return error.Socket;
     _ = swc.setenv("WAYLAND_DISPLAY", sock, 1);
 
     _ = swc.signal(swc.SIGINT, sigHandler);
@@ -900,9 +1460,12 @@ fn setup() !void {
     try ipcSetup();
 }
 
+fn runAutostartIdle(_: ?*anyopaque) callconv(.c) void {
+    runAutostart();
+}
+
 fn runAutostart() void {
     var buf: [512:0]u8 = undefined;
-
     const env_path = swc.getenv("IKWM_AUTOSTART");
     if (env_path != null) {
         const pid = swc.fork();
@@ -913,13 +1476,11 @@ fn runAutostart() void {
         }
         return;
     }
-
     const home = swc.getenv("HOME");
     if (home == null) return;
     const home_str = std.mem.span(home.?);
-    const path = std.fmt.bufPrintZ(&buf, "{s}/.config/ikwm/autostart", .{home_str}) catch return;
+    const path = std.fmt.bufPrintZ(&buf, "{s}/.config/ikwm/ikrc", .{home_str}) catch return;
     if (swc.access(path.ptr, swc.X_OK) != 0) return;
-
     const pid = swc.fork();
     if (pid == 0) {
         _ = swc.setsid();
@@ -939,12 +1500,14 @@ pub fn main(init: std.process.Init) !void {
     try setup();
     defer {
         if (wm.retile_idle) |src| _ = swc.wl_event_source_remove(src);
+        wm.subscribers.deinit();
+        freeAllModes();
         if (wm.ipc_path[0] != 0) _ = swc.unlink(&wm.ipc_path);
         for (&wm.workspaces) |*ws| ws.deinit();
         swc.swc_finalize();
         swc.wl_display_destroy(wm.dpy);
     }
 
-    runAutostart();
+    _ = swc.wl_event_loop_add_idle(wm.ev_loop, runAutostartIdle, null);
     swc.wl_display_run(wm.dpy);
 }
