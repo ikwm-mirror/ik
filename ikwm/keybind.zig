@@ -49,26 +49,46 @@ pub fn registerBind(bind: *w.Bind) void {
     );
 }
 
+pub fn unregisterBind(bind: *w.Bind) void {
+    _ = swc.swc_remove_binding(swc.SWC_BINDING_KEY, bind.mods, bind.sym);
+}
+
 pub fn activateMode(idx: usize) void {
+    if (idx == w.wm.mode_idx) return;
+
+    const old_m = &w.wm.modes[w.wm.mode_idx];
+    var it: ?*swc.struct_wl_list = old_m.binds.next;
+    while (it != &old_m.binds) : (it = it.?.next) {
+        const b: *w.Bind = @fieldParentPtr("link", it.?);
+        unregisterBind(b);
+    }
+
     w.wm.mode_idx = idx;
+
+    const new_m = &w.wm.modes[idx];
+    it = new_m.binds.next;
+    while (it != &new_m.binds) : (it = it.?.next) {
+        const b: *w.Bind = @fieldParentPtr("link", it.?);
+        registerBind(b);
+    }
+
     notify(sub.EVT_MODE);
 }
 
 pub fn addBind(def: ipc.BindDef) void {
     const mode_idx = defineMode(def.mode) catch return;
     const m = &w.wm.modes[mode_idx];
-
     var it: ?*swc.struct_wl_list = m.binds.next;
     while (it != &m.binds) : (it = it.?.next) {
         const b: *w.Bind = @fieldParentPtr("link", it.?);
         if (b.mods == def.key.mods and b.sym == def.key.sym) {
+            if (mode_idx == w.wm.mode_idx) unregisterBind(b);
             w.gpa.free(b.command);
             swc.wl_list_remove(&b.link);
             w.gpa.destroy(b);
             break;
         }
     }
-
     const bind = w.gpa.create(w.Bind) catch return;
     bind.* = .{
         .mods = def.key.mods,
@@ -81,7 +101,7 @@ pub fn addBind(def: ipc.BindDef) void {
         .link = undefined,
     };
     swc.wl_list_insert(&m.binds, &bind.link);
-    registerBind(bind);
+    if (mode_idx == w.wm.mode_idx) registerBind(bind);
 }
 
 pub fn removeBind(mode_name: []const u8, key: ipc.BindKey) void {
@@ -91,6 +111,7 @@ pub fn removeBind(mode_name: []const u8, key: ipc.BindKey) void {
     while (it != &m.binds) : (it = it.?.next) {
         const b: *w.Bind = @fieldParentPtr("link", it.?);
         if (b.mods == key.mods and b.sym == key.sym) {
+            if (mode_idx == w.wm.mode_idx) unregisterBind(b);
             w.gpa.free(b.command);
             swc.wl_list_remove(&b.link);
             w.gpa.destroy(b);
