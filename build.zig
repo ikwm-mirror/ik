@@ -2,7 +2,9 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .ReleaseFast,
+    });
 
     const neuswc_dep = b.dependency("neuswc", .{
         .target = target,
@@ -12,7 +14,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const swc_tc = b.addTranslateC(.{
-        .root_source_file = b.path("src/swc_include.h"),
+        .root_source_file = b.path("ikwm/swc_include.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -26,7 +28,7 @@ pub fn build(b: *std.Build) void {
     const dynlib: std.Build.Module.LinkSystemLibraryOptions = .{ .preferred_link_mode = .dynamic };
 
     const ikwm_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("ikwm/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -57,11 +59,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    ctl_mod.addCSourceFile(.{ .file = b.path("src/ikwmc.c"), .flags = &.{"-std=c11"} });
+    ctl_mod.addCSourceFile(.{ .file = b.path("ikc/client.c"), .flags = &.{"-std=c11"} });
     ctl_mod.link_libc = true;
 
     const ctl = b.addExecutable(.{
-        .name = "ikwmc",
+        .name = "ikc",
         .root_module = ctl_mod,
     });
 
