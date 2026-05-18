@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const swc_tc = b.addTranslateC(.{
-        .root_source_file = b.path("ikwm/swc_include.h"),
+        .root_source_file = b.path("include/swc_include.h"),
         .target = target,
         .optimize = optimize,
     });
