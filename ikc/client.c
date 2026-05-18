@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 static const char *usage =
-    "Usage: ikwmctl <domain> <command> [args]\n"
+    "Usage: ikc <domain> <command> [args]\n"
     "\n"
     "Node:\n"
     "  node focus next|prev|left|right|up|down\n"
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
   strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
 
   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    fprintf(stderr, "ikwmctl: cannot connect to %s: ", sock_path);
+    fprintf(stderr, "ikc: cannot connect to %s: ", sock_path);
     perror(NULL);
     close(sock);
     free(cmd);
