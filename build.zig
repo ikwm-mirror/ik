@@ -22,8 +22,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     swc_tc.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    swc_tc.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
     swc_tc.addIncludePath(.{ .cwd_relative = "/usr/include/libdrm" });
+    swc_tc.addIncludePath(.{ .cwd_relative = "/usr/local/include/libdrm" });
     swc_tc.addIncludePath(.{ .cwd_relative = "/usr/include/pixman-1" });
+    swc_tc.addIncludePath(.{ .cwd_relative = "/usr/local/include/pixman-1" });
     swc_tc.addIncludePath(neuswc_dep.path("libswc"));
 
     const swc_mod = swc_tc.createModule();
