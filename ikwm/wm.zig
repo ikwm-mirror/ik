@@ -55,6 +55,7 @@ pub const Config = struct {
 pub const Grab = struct {
     active: bool = false,
     resize: bool = false,
+    edge: u32 = 0,
     c: ?*Client = null,
 };
 
@@ -69,10 +70,19 @@ pub const Bind = struct {
     link: swc.struct_wl_list,
 };
 
+pub const MouseBind = struct {
+    mods: u32,
+    button: u32,
+    command: []u8,
+    mode_idx: usize,
+    link: swc.struct_wl_list,
+};
+
 pub const Mode = struct {
     name: [MODE_NAME_MAX]u8 = std.mem.zeroes([MODE_NAME_MAX]u8),
     name_len: usize = 0,
     binds: swc.struct_wl_list = undefined,
+    mouse_binds: swc.struct_wl_list = undefined,
 };
 
 pub const Workspace = struct {

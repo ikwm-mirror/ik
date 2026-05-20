@@ -266,6 +266,29 @@ pub fn writeBindsJson(mode_name: []const u8, wr: *std.Io.Writer) !void {
     try panthera.stringify(list[0..count], .{}, wr);
 }
 
+const MouseBindJson = struct { mode: []const u8, mods: u32, button: u32, command: []const u8 };
+
+pub fn writeMouseBindsJson(mode_name: []const u8, wr: *std.Io.Writer) !void {
+    const mode_idx = findMode(mode_name) orelse return;
+    const m = &w.wm.modes[mode_idx];
+
+    var list: [256]MouseBindJson = undefined;
+    var count: usize = 0;
+
+    var it: ?*swc.struct_wl_list = m.mouse_binds.next;
+    while (it != &m.mouse_binds and count < list.len) : (it = it.?.next) {
+        const b: *w.MouseBind = @fieldParentPtr("link", it.?);
+        list[count] = .{
+            .mode = m.name[0..m.name_len],
+            .mods = b.mods,
+            .button = b.button,
+            .command = b.command,
+        };
+        count += 1;
+    }
+    try panthera.stringify(list[0..count], .{}, wr);
+}
+
 pub fn dispatchQuery(cmd: ipc.QueryCmd, fd: c_int) void {
     if (fd < 0) return;
 
@@ -303,6 +326,9 @@ pub fn dispatchQuery(cmd: ipc.QueryCmd, fd: c_int) void {
         },
         .binds => |name| {
             writeBindsJson(name, &wr) catch return;
+        },
+        .mouse_binds => |name| {
+            writeMouseBindsJson(name, &wr) catch return;
         },
     }
 

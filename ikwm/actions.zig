@@ -186,6 +186,76 @@ pub fn setFloating(floating: bool) void {
     notify(sub.EVT_CLIENT);
 }
 
+pub fn toggleFloating() void {
+    const cl = w.wm.sel_client orelse return;
+    setFloating(!cl.floating);
+}
+
+pub fn mouseMove() void {
+    const cl = w.wm.sel_client orelse return;
+    if (w.wm.grab.active) return;
+    if (!cl.floating) {
+        if (cl.bsp_node) |n| {
+            const ws = &w.wm.workspaces[cl.ws - 1];
+            if (ws.focused_node == n) ws.focused_node = null;
+            ws.tree.remove(n);
+            cl.bsp_node = null;
+        }
+        cl.floating = true;
+        swc.swc_window_set_stacked(cl.win);
+        r.scheduleRetile();
+        notify(sub.EVT_CLIENT);
+    }
+    w.wm.grab = .{ .active = true, .resize = false, .edge = 0, .c = cl };
+    swc.swc_window_begin_move(cl.win);
+}
+
+pub fn mouseResize(edge_arg: ?ipc.ResizeEdge) void {
+    const cl = w.wm.sel_client orelse return;
+    if (w.wm.grab.active) return;
+    if (!cl.floating) {
+        if (cl.bsp_node) |n| {
+            const ws = &w.wm.workspaces[cl.ws - 1];
+            if (ws.focused_node == n) ws.focused_node = null;
+            ws.tree.remove(n);
+            cl.bsp_node = null;
+        }
+        cl.floating = true;
+        swc.swc_window_set_stacked(cl.win);
+        r.scheduleRetile();
+        notify(sub.EVT_CLIENT);
+    }
+    const edge: u32 = if (edge_arg) |e| e.toSwc() else blk: {
+        var px: i32 = 0;
+        var py: i32 = 0;
+        _ = swc.swc_cursor_position(&px, &py);
+        px >>= 8;
+        py >>= 8;
+        var geom: swc.swc_rectangle = undefined;
+        _ = swc.swc_window_get_geometry(cl.win, &geom);
+        const mid_x = geom.x + @as(i32, @intCast(geom.width / 2));
+        const mid_y = geom.y + @as(i32, @intCast(geom.height / 2));
+        var e: u32 = 0;
+        if (px < mid_x) e |= swc.SWC_WINDOW_EDGE_LEFT else e |= swc.SWC_WINDOW_EDGE_RIGHT;
+        if (py < mid_y) e |= swc.SWC_WINDOW_EDGE_TOP else e |= swc.SWC_WINDOW_EDGE_BOTTOM;
+        break :blk e;
+    };
+    w.wm.grab = .{ .active = true, .resize = true, .edge = edge, .c = cl };
+    swc.swc_window_begin_resize(cl.win, edge);
+}
+
+pub fn mouseRelease() void {
+    if (!w.wm.grab.active) return;
+    if (w.wm.grab.c) |gc| {
+        if (w.wm.grab.resize) {
+            swc.swc_window_end_resize(gc.win);
+        } else {
+            swc.swc_window_end_move(gc.win);
+        }
+    }
+    w.wm.grab = .{};
+}
+
 pub fn setSplit(dir: bsp.Dir) void {
     const ws = w.curWs();
     const node = ws.focused_node orelse return;

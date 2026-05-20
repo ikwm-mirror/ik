@@ -32,6 +32,7 @@ fn dispatchNode(cmd: ipc.NodeCmd) void {
         .fullscreen => act.toggleFullscreen(),
         .floating => act.setFloating(true),
         .tiling => act.setFloating(false),
+        .toggle_floating => act.toggleFloating(),
         .rotate => act.rotateSplit(),
         .ratio => |v| act.setRatio(v),
         .split => |d| act.setSplit(d),
@@ -135,6 +136,7 @@ fn applyConfig(s: ipc.ConfigSet) void {
 }
 
 fn dispatchBind(cmd: ipc.BindCmd, reply_fd: c_int) void {
+    std.log.debug("dispatchBind tag={s}", .{@tagName(cmd)});
     switch (cmd) {
         .add => |def| kb.addBind(def),
         .list => |name| {
@@ -142,6 +144,16 @@ fn dispatchBind(cmd: ipc.BindCmd, reply_fd: c_int) void {
             var buf: [16384]u8 = undefined;
             var wr: std.Io.Writer = .fixed(&buf);
             j.writeBindsJson(name, &wr) catch return;
+            _ = wr.writeByte('\n') catch {};
+            const out = wr.buffered();
+            _ = swc.write(reply_fd, out.ptr, out.len);
+        },
+        .mouse_add => |def| kb.addMouseBind(def),
+        .mouse_list => |name| {
+            if (reply_fd < 0) return;
+            var buf: [16384]u8 = undefined;
+            var wr: std.Io.Writer = .fixed(&buf);
+            j.writeMouseBindsJson(name, &wr) catch return;
             _ = wr.writeByte('\n') catch {};
             const out = wr.buffered();
             _ = swc.write(reply_fd, out.ptr, out.len);
@@ -169,6 +181,8 @@ fn dispatchWm(cmd: ipc.WmCmd) void {
         .quit => swc.wl_display_terminate(w.wm.dpy),
         .reload => runAutostart(),
         .spawn => |s| act.spawnCmd(s),
+        .mouse_move => act.mouseMove(),
+        .mouse_resize => |edge| act.mouseResize(edge),
     }
 }
 
