@@ -10,6 +10,13 @@ const jn = @import("json.zig");
 const dp = @import("dispatch.zig");
 const sub = @import("subscriber.zig");
 
+// --- Aliases ---
+
+const Io = std.Io;
+const fs = Io.Dir;
+const net = Io.net;
+const unix = net.UnixAddress;
+
 // --- Hardware Callbacks ---
 
 var window_handler: swc.swc_window_handler = .{
@@ -142,28 +149,15 @@ fn ipcSetup() !void {
     var path_buf: [256]u8 = undefined;
     const path = ipcSocketPath(&path_buf);
 
-    _ = swc.unlink(@as([*:0]const u8, @ptrCast(path.ptr)));
+    fs.deleteDirAbsolute(w.io.*, path) catch {};
 
-    const sock = swc.socket(swc.AF_UNIX, swc.SOCK_STREAM | swc.SOCK_CLOEXEC | swc.SOCK_NONBLOCK, 0);
-    if (sock < 0) return error.SocketCreate;
-    errdefer _ = swc.close(sock);
-
-    var addr: swc.sockaddr_un = undefined;
-    @memset(std.mem.asBytes(&addr), 0);
-    addr.sun_family = swc.AF_UNIX;
-    const max_len = @typeInfo(@TypeOf(addr.sun_path)).array.len - 1;
-    const copy_len = @min(path.len, max_len);
-    @memcpy(addr.sun_path[0..copy_len], path[0..copy_len]);
-    addr.sun_path[copy_len] = 0;
-
-    if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0) {
-        _ = swc.unlink(@ptrCast(&addr.sun_path));
-        if (swc.bind(sock, @ptrCast(&addr), @sizeOf(swc.sockaddr_un)) < 0)
-            return error.Bind;
-    }
-    if (swc.listen(sock, 16) < 0) return error.Listen;
+    const addr = try unix.init(path);
+    const server = try addr.listen(w.io.*, .{ .kernel_backlog = 16 });
+    const sock: i32 = server.socket.handle;
 
     w.wm.ipc_server_fd = sock;
+    w.wm.ipc_server = server;
+
     @memcpy(w.wm.ipc_path[0..path.len], path);
     w.wm.ipc_path[path.len] = 0;
 
@@ -176,9 +170,7 @@ fn ipcSetup() !void {
     );
     if (w.wm.ipc_source == null) return error.EventLoopAddFd;
 
-    var env_buf: [272]u8 = undefined;
-    const env_val = std.fmt.bufPrintZ(&env_buf, "{s}", .{path}) catch return;
-    _ = swc.setenv("IKWM_SOCKET", env_val.ptr, 1);
+    try w.env.put("IKWM_SOCKET", path);
 }
 
 const IpcConn = struct {
@@ -350,6 +342,8 @@ fn runAutostartIdle(_: ?*anyopaque) callconv(.c) void {
 
 pub fn main(init: std.process.Init) !void {
     w.gpa = init.gpa;
+    w.env = init.environ_map;
+    w.io = &init.io;
 
     std.log.info("starting ikwm", .{});
 

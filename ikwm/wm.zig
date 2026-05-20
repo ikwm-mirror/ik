@@ -3,6 +3,8 @@ const swc = @import("swc");
 const bsp = @import("bsp.zig");
 const sub = @import("subscriber.zig");
 
+const net = std.Io.net;
+
 // --- Types ---
 
 pub const Screen = struct {
@@ -110,6 +112,7 @@ pub const Wm = struct {
     ipc_server_fd: std.posix.socket_t = -1,
     ipc_source: ?*swc.wl_event_source = null,
     ipc_path: [256:0]u8 = std.mem.zeroes([256:0]u8),
+    ipc_server: net.Server = undefined,
 
     retile_pending: bool = false,
     retile_idle: ?*swc.wl_event_source = null,
@@ -125,6 +128,8 @@ pub const Wm = struct {
 
 pub var wm: Wm = undefined;
 pub var gpa: std.mem.Allocator = undefined;
+pub var env: *std.process.Environ.Map = undefined;
+pub var io: *const std.Io = undefined;
 
 // --- Helpers ---
 

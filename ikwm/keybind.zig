@@ -56,7 +56,6 @@ pub fn unregisterBind(bind: *w.Bind) void {
 }
 
 pub fn onMouseFire(data: ?*anyopaque, _: u32, _: u32, state: u32) callconv(.c) void {
-    std.log.debug("mouse fired", .{});
     if (state == swc.WL_POINTER_BUTTON_STATE_RELEASED) {
         mouseRelease();
         return;
@@ -68,14 +67,13 @@ pub fn onMouseFire(data: ?*anyopaque, _: u32, _: u32, state: u32) callconv(.c) v
 }
 
 pub fn registerMouseBind(bind: *w.MouseBind) void {
-    const ret = swc.swc_add_binding(
+    _ = swc.swc_add_binding(
         swc.SWC_BINDING_BUTTON,
         bind.mods,
         bind.button,
         onMouseFire,
         bind,
     );
-    std.log.debug("registerMouseBind mods={x} button={x} ret={d}", .{ bind.mods, bind.button, ret });
 }
 
 pub fn unregisterMouseBind(bind: *w.MouseBind) void {
@@ -144,8 +142,6 @@ pub fn addBind(def: ipc.BindDef) void {
 }
 
 pub fn addMouseBind(def: ipc.MouseBindDef) void {
-    std.log.debug("addMouseBind called mode={s} mods={x} button={x} cmd={s}", .{ def.mode, def.mods, def.button, def.command });
-
     const mode_idx = defineMode(def.mode) catch return;
     const m = &w.wm.modes[mode_idx];
     var it: ?*swc.struct_wl_list = m.mouse_binds.next;
@@ -170,7 +166,6 @@ pub fn addMouseBind(def: ipc.MouseBindDef) void {
         .mode_idx = mode_idx,
         .link = undefined,
     };
-    std.log.debug("addMouseBind mods={x} button={x} cmd={s}", .{ def.mods, def.button, def.command });
     swc.wl_list_insert(&m.mouse_binds, &bind.link);
     if (mode_idx == w.wm.mode_idx) registerMouseBind(bind);
 }

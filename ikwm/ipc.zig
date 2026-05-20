@@ -299,7 +299,6 @@ pub fn parseBindKey(s: []const u8) ParseError!BindKey {
 }
 
 pub fn parseMouseKey(s: []const u8) ParseError!struct { mods: u32, button: u32 } {
-    std.log.debug("parseMouseKey input='{s}'", .{s});
     var mods: u32 = 0;
     var tail = s;
     while (std.mem.indexOf(u8, tail, "+")) |plus| {
