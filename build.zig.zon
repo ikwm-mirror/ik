@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .neuswc = .{
-            .url = "git+https://codeberg.org/ikwm/neuswc.git#4e1b3661f7151759684ec053dd37d69a199fd482",
-            .hash = "neuswc-0.0.0-6uQoquf8CgD7j83A7WIrCJ5AmZq9GTW8ByMTXeJCnVI5",
+            .url = "git+https://codeberg.org/ikwm/neuswc.git#97e885a7a08d280a6313734fab0c8d85b3a13634",
+            .hash = "neuswc-0.0.0-6uQoqmv9CgD7Mw4Zz2_Ttsl6OMHD5es1CPcT2Bz4OHn2",
         },
         .panthera = .{
             .url = "git+https://codeberg.org/shar/panthera#3783687c53559aa6138e4e4c29788ef041d4a9bd",
