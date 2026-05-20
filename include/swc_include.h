@@ -1,6 +1,14 @@
 /* all the headers we want */
 #include <fcntl.h>
+
+#ifdef __linux__
 #include <linux/input-event-codes.h>
+#endif // __linux__
+
+#ifdef __FreeBSD__
+#include <dev/evdev/input-event-codes.h>
+#endif // __FreeBSD__
+
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
