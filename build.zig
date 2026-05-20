@@ -6,11 +6,14 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseFast,
     });
 
+    const os_tag = target.result.os.tag;
+
     const neuswc_dep = b.dependency("neuswc", .{
         .target = target,
         .optimize = optimize,
         .linkage = std.builtin.LinkMode.static,
         .xwayland = true,
+        .udev = os_tag == .linux,
     });
 
     const swc_tc = b.addTranslateC(.{
@@ -40,7 +43,10 @@ pub fn build(b: *std.Build) void {
     ikwm_mod.linkSystemLibrary("drm", dynlib);
     ikwm_mod.linkSystemLibrary("pixman-1", dynlib);
     ikwm_mod.linkSystemLibrary("input", dynlib);
-    ikwm_mod.linkSystemLibrary("libudev", dynlib);
+    if (os_tag == .linux) {
+        ikwm_mod.linkSystemLibrary("libudev", dynlib);
+        ikwm_mod.linkSystemLibrary("input", dynlib);
+    }
     ikwm_mod.link_libc = true;
 
     const exe = b.addExecutable(.{
@@ -68,6 +74,9 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(ctl);
+
+    const swc_launch = neuswc_dep.artifact("swc-launch");
+    b.installArtifact(swc_launch);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
