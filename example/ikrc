@@ -1,0 +1,69 @@
+#!/bin/sh
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SOCKET="${IKWM_SOCKET:-$XDG_RUNTIME_DIR/ikwm.sock}"
+
+echo "waiting for $SOCKET" >&2
+for i in $(seq 1 50); do
+  [ -S "$SOCKET" ] && break
+  sleep 0.1
+done
+
+if [ ! -S "$SOCKET" ]; then
+  echo "socket never appeared" >&2
+  exit 1
+fi
+
+# --- Candy ---
+
+ikc config set gap_outer 18
+ikc config set gap_inner 15
+ikc config set border_width 2
+ikc config set border_outer_width 4
+ikc config set border_outer_color_active 141118
+ikc config set border_outer_color_normal 141118
+ikc config set border_color_active a095b2
+ikc config set border_color_normal 27222f
+ikc desktop count 7
+
+# --- Keybinds ---
+
+ikc bind add super+Return wm spawn footclient
+ikc bind add super+q node kill
+ikc bind add super+d wm spawn wofi --show drun
+ikc bind add super+space node toggle_floating
+
+ikc mode define power
+
+ikc bind add power q wm quit
+ikc bind add power r wm reload
+ikc bind add power s wm spawn systemctl poweroff
+ikc bind add power h wm spawn systemctl reboot
+
+ikc bind add super+p mode enter power
+ikc bind add power Escape mode leave
+
+ikc bind add super+1 desktop focus 1
+ikc bind add super+2 desktop focus 2
+ikc bind add super+3 desktop focus 3
+ikc bind add super+4 desktop focus 4
+ikc bind add super+5 desktop focus 5
+ikc bind add super+6 desktop focus 6
+ikc bind add super+7 desktop focus 7
+
+ikc bind add super+shift+1 desktop send 1
+ikc bind add super+shift+2 desktop send 2
+ikc bind add super+shift+3 desktop send 3
+ikc bind add super+shift+4 desktop send 4
+ikc bind add super+shift+5 desktop send 5
+ikc bind add super+shift+6 desktop send 6
+ikc bind add super+shift+7 desktop send 7
+
+# --- Mouse ---
+
+ikc bind mouse_add super+left wm mouse_move
+ikc bind mouse_add super+right wm mouse_resize
+
+# --- Autostart ---
+
+foot --server &
+wawa fill /home/shar/Pictures/wallpapers/kitty.png &
