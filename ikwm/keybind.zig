@@ -7,6 +7,12 @@ const dispatch = @import("dispatch.zig");
 const notify = @import("json.zig").notify;
 const mouseRelease = @import("actions.zig").mouseRelease;
 
+extern fn swc_remove_binding(
+    @"type": swc.swc_binding_type,
+    modifiers: u32,
+    value: u32,
+) void;
+
 pub fn modeName(m: *const w.Mode) []const u8 {
     return m.name[0..m.name_len];
 }
@@ -52,7 +58,7 @@ pub fn registerBind(bind: *w.Bind) void {
 }
 
 pub fn unregisterBind(bind: *w.Bind) void {
-    _ = swc.swc_remove_binding(swc.SWC_BINDING_KEY, bind.mods, bind.sym);
+    _ = swc_remove_binding(swc.SWC_BINDING_KEY, bind.mods, bind.sym);
 }
 
 pub fn onMouseFire(data: ?*anyopaque, _: u32, _: u32, state: u32) callconv(.c) void {
@@ -77,7 +83,7 @@ pub fn registerMouseBind(bind: *w.MouseBind) void {
 }
 
 pub fn unregisterMouseBind(bind: *w.MouseBind) void {
-    _ = swc.swc_remove_binding(swc.SWC_BINDING_BUTTON, bind.mods, bind.button);
+    _ = swc_remove_binding(swc.SWC_BINDING_BUTTON, bind.mods, bind.button);
 }
 
 pub fn activateMode(idx: usize) void {

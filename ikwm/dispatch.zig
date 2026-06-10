@@ -121,7 +121,6 @@ fn applyConfig(s: ipc.ConfigSet) void {
         },
         .wallpaper_color => |v| {
             cfg.wallpaper_color = v;
-            swc.swc_wallpaper_color_set(v);
         },
         .decor => |v| r.setDecorFocused(v),
         .decor_default => |v| {

@@ -297,8 +297,6 @@ fn setup() !void {
         return error.SwcInit;
     }
 
-    swc.swc_wallpaper_color_set(w.wm.cfg.wallpaper_color);
-
     const sock = swc.wl_display_add_socket_auto(w.wm.dpy) orelse return error.Socket;
     _ = swc.setenv("WAYLAND_DISPLAY", sock, 1);
 
